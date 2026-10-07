@@ -1445,6 +1445,12 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   rawSheetPrefab: {fileID: 919132149155446097, guid: 6083ea2e6375f5c4889eaeda15ae5bb8, type: 3}
   finishedPartPrefab: {fileID: 919132149155446097, guid: 406f55621df25d040bdf9bb24388414a, type: 3}
+  bendingPiecePrefabs:
+  - {fileID: 919132149155446097, guid: 3f3549d05fb679040bf61f912dcd2915, type: 3}
+  - {fileID: 919132149155446097, guid: 382233dde98e7d24ebd44a868172e9ed, type: 3}
+  - {fileID: 919132149155446097, guid: 0cf120a70ab2431488c7a1581af7fcee, type: 3}
+  - {fileID: 919132149155446097, guid: c07b35fa6ff4f2848b578f92421fbbd3, type: 3}
+  - {fileID: 919132149155446097, guid: 6a700cbfda158334298966a1603acf95, type: 3}
   workpieceRoot: {fileID: 1638862832}
   materialTable: {fileID: 11770553}
   controlConsole: {fileID: 494989002}

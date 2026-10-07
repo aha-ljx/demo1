@@ -19,14 +19,17 @@ public sealed class LoadingProcessController : MonoBehaviour
         PunchClampPullBack, PunchClampMoveToRailEnd, FinishedPartDelivered,
         SlideFinishedPartToTableEdge, ArmBaseTravel, ArmRotateToPart,
         ArmSuctionPickup, ArmLiftPart, ArmRestorePosture,
-        ArmBaseToBendingProbe, ArmBendToProbe,
-        PlacePartOnBendingProbe, ArmClearBendingProbe,
+        ArmBaseToBendingMold, ArmApproachBendingMold,
+        TurnSuctionUp, PositionBendEdge, CloseBendingDie,
+        OpenBendingDie, BendingComplete, ArmToHClamps,
+        PlaceBentPartInHClamps, ArmReturnToRailEnd,
         ReadyForPunching
     }
 
     [Header("工件与设备")]
     public GameObject rawSheetPrefab;
     public GameObject finishedPartPrefab;
+    public GameObject[] bendingPiecePrefabs;
     public Transform workpieceRoot;
     public Renderer materialTable;
     public Renderer controlConsole;
@@ -97,6 +100,12 @@ public sealed class LoadingProcessController : MonoBehaviour
     [Min(0.01f)] public float armPickupSpeed = 0.35f;
     [Min(0.01f)] public float armLiftHeight = 0.15f;
     [Min(0f)] public float armPickupRailInset = 0.15f;
+    [Range(0f, 120f)] public float armThirdLinkBackAngle = 35f;
+    [Range(0f, 120f)] public float armFourthLinkForwardAngle = 55f;
+    [Min(0.01f)] public float bendingPressSpeed = 0.25f;
+    [Min(0f)] public float bendingDieClearance = 0.004f;
+    [Min(0f)] public float bendingPressHold = 0.25f;
+    [Min(0.01f)] public float hClampApproachClearance = 0.18f;
 
     public LoadingState CurrentState { get; private set; } = LoadingState.Idle;
     public bool SuctionActive { get; private set; }
@@ -132,10 +141,32 @@ public sealed class LoadingProcessController : MonoBehaviour
     private Transform armLongSlot, armBaseAssembly, armBaseJoint;
     private Transform armSuctionAssembly, bendingProbe;
     private Transform bendingBody, bendingRail;
+    private Transform bendingUpper, bendingUpperMold, bendingLowerMold;
+    private Transform[] bendingUpperVisuals;
+    private Vector3[] bendingUpperHomePositions;
     private Transform[] armSegments, armMovingVisuals, armSliders;
     private Transform[] armOriginalParents;
     private Transform armRig;
+    private Transform armThirdJoint, armFourthJoint, armSixthJoint;
+    private Quaternion armThirdHomeRotation, armFourthHomeRotation,
+        armSixthHomeRotation;
+    private Transform armWristRig;
+    private Transform[] armWristVisuals, armWristOriginalParents;
+    private Quaternion armWristHomeLocalRotation;
     private Transform armContactAnchor;
+    private Transform armWristStem;
+    private Transform[] bentFlaps;
+    private Bounds bentPanelBoundsLocal;
+    private struct HClampGap
+    {
+        public Vector3 center;
+        public Vector3 direction;
+        public float near, far;
+        public Vector3 tangent;
+        public float tangentMin, tangentMax;
+    }
+    private Vector3[] cupTipLocalPoints;
+    private Vector3 finishedTopLocalNormal = Vector3.up;
     private Vector3[] armVisualHomePositions;
     private Quaternion[] armVisualHomeRotations;
     private Transform armBaseMover;
@@ -162,6 +193,10 @@ public sealed class LoadingProcessController : MonoBehaviour
         BindTransferArm();
         bendingBody = FindModelNode(268);
         bendingRail = FindModelNode(411);
+        bendingUpper = FindModelNode(121);
+        bendingUpperMold = FindModelNode(1565);
+        bendingLowerMold = FindModelNode(1547);
+        bendingUpperVisuals = new[] { bendingUpper, bendingUpperMold };
         if (punchClampBrackets == null || punchClampBrackets.Length != 2)
             punchClampBrackets = new[] { FindModelNode(1513), FindModelNode(1499) };
         if (punchClampVisuals != null && punchClampVisuals.Length == 2
@@ -176,6 +211,9 @@ public sealed class LoadingProcessController : MonoBehaviour
             && punchClampHomePoint != null && punchRailEndPoint != null)
             punchRailStartPoint = CreateRuntimeRailStart(punchClampRail,
                 punchClampHomePoint, punchRailEndPoint, "PunchRailStartPoint (runtime)");
+#if UNITY_EDITOR
+        EnsureBendingPieceReferencesForPlay();
+#endif
         if (!ValidateSetup()) return;
         SyncPunchClampPointsToPlacedAssemblies();
         // 控制空节点不属于 FBX。旧场景中它可能留在世界原点，模型本身仍在导轨上。
@@ -205,15 +243,47 @@ public sealed class LoadingProcessController : MonoBehaviour
         }
         armOriginalParents[armSegments.Length] = armSuctionAssembly.parent;
         armSuctionAssembly.SetParent(armRig, true);
-        Vector3 cupContact = FindSuctionCupContactPoint();
+        armThirdJoint = CreateArmJoint("Arm3 r848 pivot at Arm2 r851",
+            armSegments[3].position, armRig);
+        armFourthJoint = CreateArmJoint("Arm4 r845 lower pivot",
+            armSegments[2].position, armThirdJoint);
+        armSixthJoint = CreateArmJoint("Arm6 r839 pivot",
+            armSegments[0].position, armFourthJoint);
+        armSegments[3].SetParent(armThirdJoint, true);
+        armSegments[2].SetParent(armFourthJoint, true);
+        armSegments[1].SetParent(armFourthJoint, true);
+        armSegments[0].SetParent(armSixthJoint, true);
+        armSuctionAssembly.SetParent(armSixthJoint, true);
+        armThirdHomeRotation = armThirdJoint.localRotation;
+        armFourthHomeRotation = armFourthJoint.localRotation;
+        armSixthHomeRotation = armSixthJoint.localRotation;
+        armWristStem = FindModelNode(armSuctionAssembly, 857);
+        armWristVisuals = new[] { armWristStem,
+            FindModelNode(armSuctionAssembly, 863),
+            FindModelNode(armSuctionAssembly, 860), FindModelNode(armSuctionAssembly, 866),
+            FindModelNode(armSuctionAssembly, 867), FindModelNode(armSuctionAssembly, 868) };
+        armWristRig = new GameObject("BendingWrist (runtime)").transform;
+        armWristRig.position = armWristStem.position;
+        armWristRig.SetParent(armSuctionAssembly, true);
+        armWristOriginalParents = new Transform[armWristVisuals.Length];
+        for (int i = 0; i < armWristVisuals.Length; i++)
+        {
+            armWristOriginalParents[i] = armWristVisuals[i].parent;
+            armWristVisuals[i].SetParent(armWristRig, true);
+        }
+        armWristHomeLocalRotation = armWristRig.localRotation;
+        if (!CacheCupTipPlane()) return;
+        Vector3 cupContact, cupNormal;
+        GetCupTipPlane(out cupContact, out cupNormal);
         armContactAnchor = new GameObject("SuctionContact (runtime)").transform;
-        armContactAnchor.SetParent(armSuctionAssembly, false);
+        armContactAnchor.SetParent(armWristRig, false);
         armContactAnchor.position = cupContact;
         armMovingVisuals = new[] { armBaseAssembly, armRig };
         armBaseMover = new GameObject("ArmBaseMover (runtime)").transform;
         armBaseHome = GetBounds(armBaseAssembly).center;
         armBaseMover.position = armBaseHome;
         armVisualHomePositions = SavePositions(armMovingVisuals);
+        bendingUpperHomePositions = SavePositions(bendingUpperVisuals);
         armVisualHomeRotations = new Quaternion[armMovingVisuals.Length];
         for (int i = 0; i < armMovingVisuals.Length; i++)
             armVisualHomeRotations[i] = armMovingVisuals[i].rotation;
@@ -286,10 +356,19 @@ public sealed class LoadingProcessController : MonoBehaviour
     private void OnDestroy()
     {
         if (rawSheetMaterial != null) Destroy(rawSheetMaterial);
+        if (bendingUpperHomePositions != null)
+            RestorePositions(bendingUpperVisuals, bendingUpperHomePositions);
         if (armBaseMover != null) Destroy(armBaseMover.gameObject);
         if (armRig != null)
         {
             if (armContactAnchor != null) Destroy(armContactAnchor.gameObject);
+            if (armWristRig != null)
+            {
+                for (int i = 0; i < armWristVisuals.Length; i++)
+                    if (armWristVisuals[i] != null)
+                        armWristVisuals[i].SetParent(armWristOriginalParents[i], true);
+                Destroy(armWristRig.gameObject);
+            }
             for (int i = 0; i < armSegments.Length; i++)
                 if (armSegments[i] != null)
                     armSegments[i].SetParent(armOriginalParents[i], true);
@@ -323,6 +402,7 @@ public sealed class LoadingProcessController : MonoBehaviour
         if (!initialized) return;
         if (sequence != null) StopCoroutine(sequence);
         sequence = null;
+        bentFlaps = null;
         if (sheet != rawSheetInstance)
         {
             sheet.SetParent(null, true);
@@ -349,6 +429,11 @@ public sealed class LoadingProcessController : MonoBehaviour
         for (int i = 0; i < armMovingVisuals.Length; i++)
             armMovingVisuals[i].rotation = armVisualHomeRotations[i];
         armRig.localScale = Vector3.one;
+        armThirdJoint.localRotation = armThirdHomeRotation;
+        armFourthJoint.localRotation = armFourthHomeRotation;
+        armSixthJoint.localRotation = armSixthHomeRotation;
+        armWristRig.localRotation = armWristHomeLocalRotation;
+        RestorePositions(bendingUpperVisuals, bendingUpperHomePositions);
         RestoreLocalPositions(punchJawsA, punchJawAHome);
         RestoreLocalPositions(punchJawsB, punchJawBHome);
         if (clampJawA != null) clampJawA.localPosition = jawAHome;
@@ -603,7 +688,8 @@ public sealed class LoadingProcessController : MonoBehaviour
         yield return MoveArmSuctionTo(new Vector3(contact.x, approachHeight, contact.z));
         yield return MoveArmSuctionTo(new Vector3(productTop.x, approachHeight, productTop.z));
         yield return MoveArmSuctionTo(productTop + Vector3.up * 0.005f);
-        ReparentWithoutJump(workpieceRoot, armSuctionAssembly);
+        ReparentWithoutJump(workpieceRoot, armWristRig);
+        if (!AlignFinishedPartWithCupTips()) yield break;
         SetState(LoadingState.ArmLiftPart, "机械臂吸盘抬起冲压成品");
         yield return MoveArmSuctionTo(SuctionContactPoint()
             + Vector3.up * armLiftHeight);
@@ -613,119 +699,19 @@ public sealed class LoadingProcessController : MonoBehaviour
             pickupPostureScale);
 
         Vector3 probeRailDestination;
-        if (!TryGetArmRailPositionForProbe(out probeRailDestination)) yield break;
-        SetState(LoadingState.ArmBaseToBendingProbe,
-            "滑槽基座 r872 沿 r775 移到折弯机探头 r43 方位");
+        if (!TryGetArmRailPositionForBendingMold(out probeRailDestination)) yield break;
+        SetState(LoadingState.ArmBaseToBendingMold,
+            "滑槽基座 r872 沿 r775 移到下模 r1547 方位");
         yield return MoveCarrier(armBaseMover, armMovingVisuals,
             probeRailDestination, armBaseMoveSpeed);
-
-        Vector3[] transferPosturePositions = SavePositions(armMovingVisuals);
-        Quaternion[] transferPostureRotations = SaveRotations(armMovingVisuals);
-        float transferPostureScale = armRig.localScale.x;
-        Bounds probeBounds = GetBounds(bendingProbe);
-        Vector3 railNear, railFar;
-        if (!TryRailMeshEnds(bendingRail, out railNear, out railFar))
+        yield return RunBendingSequence();
+        if (CurrentState == LoadingState.BendingComplete)
         {
-            Fail("无法读取折弯机导轨 r411 的外伸方向");
-            yield break;
+            yield return DeliverBentPartToHClamps();
+            if (CurrentState == LoadingState.ArmReturnToRailEnd)
+                SetState(LoadingState.ReadyForPunching,
+                    "成品已扣入 H 夹头，机械臂在长滑槽右端等待下一件；按 R 可重置");
         }
-        Vector3 outsideDirection = railFar - railNear;
-        outsideDirection.y = 0f;
-        if (outsideDirection.magnitude < 0.01f)
-        {
-            Fail("折弯机导轨 r411 没有有效的水平外伸方向");
-            yield break;
-        }
-        outsideDirection.Normalize();
-        if (Vector3.Dot(SheetBottomCenter() - probeBounds.center,
-            outsideDirection) < 0f)
-            outsideDirection = -outsideDirection;
-        Bounds bodyBounds = GetBounds(bendingBody);
-        float frontOfMachine = Mathf.Max(
-            Vector3.Dot(probeBounds.center, outsideDirection)
-                + HorizontalRadius(probeBounds, outsideDirection),
-            Vector3.Dot(bodyBounds.center, outsideDirection)
-                + HorizontalRadius(bodyBounds, outsideDirection));
-        float outsideLimit = frontOfMachine
-            + HorizontalRadius(GetBounds(sheet), outsideDirection) + 0.03f;
-        float outsideGap = outsideLimit + 0.15f
-            - Vector3.Dot(GetBounds(sheet).center, outsideDirection);
-        if (outsideGap > 0f)
-            yield return MoveArmSuctionTo(SuctionContactPoint()
-                + outsideDirection * outsideGap);
-        Vector3[] safePosturePositions = SavePositions(armMovingVisuals);
-        Quaternion[] safePostureRotations = SaveRotations(armMovingVisuals);
-        float safePostureScale = armRig.localScale.x;
-
-        pivot = GetBounds(armBaseJoint).center;
-        from = SuctionContactPoint() - pivot;
-        to = probeBounds.center - pivot;
-        from.y = to.y = 0f;
-        if (from.sqrMagnitude < 0.0001f || to.sqrMagnitude < 0.0001f)
-        {
-            Fail("机械臂无法计算折弯机探头方位");
-            yield break;
-        }
-        SetState(LoadingState.ArmBendToProbe, "机械臂在折弯机外侧朝探头弯曲");
-        yield return RotateArmOutsideProbe(pivot, Vector3.up,
-            Vector3.SignedAngle(from, to, Vector3.up),
-            outsideDirection, outsideLimit);
-
-        Vector3 horizontal = to.normalized;
-        Vector3 bendAxis = Vector3.Cross(Vector3.up, horizontal).normalized;
-        Vector3 targetCup = SuctionContactPoint()
-            + probeBounds.center - SheetBottomCenter();
-        float bendAngle = Vector3.SignedAngle(SuctionContactPoint() - pivot,
-            targetCup - pivot, bendAxis);
-        yield return RotateArmOutsideProbe(pivot, bendAxis,
-            Mathf.Clamp(bendAngle, -25f, 25f),
-            outsideDirection, outsideLimit);
-
-        probeBounds = GetBounds(bendingProbe);
-        Vector3 probeTip = probeBounds.center + outsideDirection
-            * HorizontalRadius(probeBounds, outsideDirection);
-        Vector3 probeBottom = new Vector3(probeTip.x,
-            probeBounds.max.y + 0.005f, probeTip.z);
-        if (Vector3.Dot(probeTip, outsideDirection) < outsideLimit - 0.02f)
-        {
-            SetState(LoadingState.ArmClearBendingProbe,
-                "固定探头位于机身内，机械臂携成品退回外侧，避免穿模");
-            yield return RestoreArmPosture(safePosturePositions,
-                safePostureRotations, safePostureScale);
-            SetState(LoadingState.ReadyForPunching,
-                "成品保持在机械臂吸盘上；固定探头无法在机身外安全接料");
-            sequence = null;
-            yield break;
-        }
-        SetState(LoadingState.PlacePartOnBendingProbe,
-            "吸盘在机器外侧将成品放到固定探头 r43 上");
-        float safePartHeight = Mathf.Max(SheetBottomCenter().y,
-            probeBottom.y + armLiftHeight);
-        yield return MoveArmSuctionTo(SuctionContactPoint()
-            + Vector3.up * (safePartHeight - SheetBottomCenter().y));
-        Vector3 slide = probeBottom - SheetBottomCenter();
-        slide.y = 0f;
-        yield return MoveArmSuctionTo(SuctionContactPoint() + slide);
-        yield return MoveArmSuctionTo(SuctionContactPoint()
-            + Vector3.up * (probeBottom.y - SheetBottomCenter().y));
-        if (Vector3.Distance(SheetBottomCenter(), probeBottom) > positionTolerance * 3f)
-        {
-            Fail("冲压成品未到达折弯机探头 r43 顶部");
-            yield break;
-        }
-        ReparentWithoutJump(workpieceRoot, workpieceHomeParent);
-        SetState(LoadingState.ArmClearBendingProbe,
-            "吸盘释放成品，机械臂恢复交接前姿态");
-        yield return MoveArmSuctionTo(SuctionContactPoint()
-            + Vector3.up * armLiftHeight);
-        float suctionClearance = outsideLimit + 0.1f
-            - Vector3.Dot(SuctionContactPoint(), outsideDirection);
-        if (suctionClearance > 0f)
-            yield return MoveArmSuctionTo(SuctionContactPoint()
-                + outsideDirection * suctionClearance);
-        yield return RestoreArmPosture(transferPosturePositions, transferPostureRotations,
-            transferPostureScale);
-        SetState(LoadingState.ReadyForPunching, "成品已交给固定探头；按 R 可重置");
         sequence = null;
     }
 
@@ -747,6 +733,1126 @@ public sealed class LoadingProcessController : MonoBehaviour
                 FindModelNode(armBaseAssembly, 880),
                 FindModelNode(armBaseAssembly, 881) }
             : null;
+    }
+
+    private static Transform CreateArmJoint(string name, Vector3 pivot,
+        Transform parent)
+    {
+        Transform joint = new GameObject(name + " (runtime)").transform;
+        joint.position = pivot;
+        joint.SetParent(parent, true);
+        return joint;
+    }
+
+    private IEnumerator RunBendingSequence()
+    {
+        Bounds lower = GetBounds(bendingLowerMold);
+        Bounds upper = GetBounds(bendingUpperMold);
+        float openGap = upper.min.y - lower.max.y;
+        if (openGap <= 0.02f)
+        {
+            Fail("折弯机上下模没有足够的初始开口");
+            yield break;
+        }
+        Vector3 railNear, railFar;
+        if (!TryRailMeshEnds(bendingRail, out railNear, out railFar))
+        {
+            Fail("无法计算折弯机的进料方向");
+            yield break;
+        }
+        Vector3 outside = railFar - railNear;
+        outside.y = 0f;
+        if (outside.sqrMagnitude < 0.0001f)
+        {
+            Fail("折弯机导轨没有水平进料方向");
+            yield break;
+        }
+        outside.Normalize();
+        if (Vector3.Dot(armBaseMover.position - lower.center, outside) < 0f)
+            outside = -outside;
+
+        SetState(LoadingState.ArmApproachBendingMold,
+            "机械臂在折弯机外侧抬起成品并朝模具弯曲");
+        Bounds body = GetBounds(bendingBody);
+        float outsideLimit = Vector3.Dot(body.center, outside)
+            + HorizontalRadius(body, outside)
+            + HorizontalRadius(GetBounds(sheet), outside) + 0.12f;
+        float outsideGap = outsideLimit
+            - Vector3.Dot(GetBounds(sheet).center, outside);
+        if (outsideGap > 0f)
+            yield return MoveArmSuctionTo(SuctionContactPoint() + outside * outsideGap);
+        float lift = lower.max.y + Mathf.Min(openGap * 0.5f, armLiftHeight)
+            - GetBounds(sheet).min.y;
+        if (lift > 0f)
+            yield return MoveArmSuctionTo(SuctionContactPoint() + Vector3.up * lift);
+
+        Vector3[] straightPositions = SavePositions(armMovingVisuals);
+        Quaternion[] straightRotations = SaveRotations(armMovingVisuals);
+        float straightScale = armRig.localScale.x;
+        Quaternion straightThird = armThirdJoint.localRotation;
+        Quaternion straightFourth = armFourthJoint.localRotation;
+        Quaternion straightSixth = armSixthJoint.localRotation;
+        Quaternion straightWrist = armWristRig.localRotation;
+        ReparentWithoutJump(workpieceRoot, armWristRig);
+        Vector3 bendAxis = Vector3.Cross(Vector3.up, outside);
+        if (bendAxis.sqrMagnitude < 0.0001f)
+        {
+            Fail("折弯机进料方向无法确定机械臂关节转轴");
+            yield break;
+        }
+        bendAxis.Normalize();
+        SetState(LoadingState.TurnSuctionUp,
+            "r848 后转、r845 前转，r839 带 r857 与吸盘向上旋转");
+        yield return ArticulateArmForBending(bendAxis, outside);
+        if (sequence == null) yield break;
+        if (!ReplaceWithBendingParts()) yield break;
+
+        Bounds localPart;
+        if (!TryGetLocalMeshBounds(sheet, out localPart))
+        {
+            Fail("冲压成品缺少可识别四边的网格");
+            yield break;
+        }
+        Vector3 extents = localPart.extents;
+        int thinAxis = extents.x < extents.y
+            ? (extents.x < extents.z ? 0 : 2)
+            : (extents.y < extents.z ? 1 : 2);
+        Vector3 firstAxis = thinAxis == 0 ? Vector3.up : Vector3.right;
+        Vector3 secondAxis = thinAxis == 2 ? Vector3.up : Vector3.forward;
+        float firstExtent = Vector3.Scale(firstAxis, extents).magnitude;
+        float secondExtent = Vector3.Scale(secondAxis, extents).magnitude;
+        Vector3[] edgeOffsets = { firstAxis * firstExtent,
+            secondAxis * secondExtent, -firstAxis * firstExtent,
+            -secondAxis * secondExtent };
+        Transform[] bendFlaps;
+        Bounds centerPanel;
+        if (!TryFindBendingFlaps(edgeOffsets, out bendFlaps, out centerPanel))
+        {
+            Fail("折弯分件模型缺少中间板或四块独立边缘");
+            yield break;
+        }
+        bentFlaps = bendFlaps;
+        bentPanelBoundsLocal = centerPanel;
+        float partRadius = Mathf.Max(GetBounds(sheet).size.x,
+            GetBounds(sheet).size.z);
+        float retractDistance = partRadius + 0.15f;
+        float dieMinX = Mathf.Max(lower.min.x, upper.min.x);
+        float dieMaxX = Mathf.Min(lower.max.x, upper.max.x);
+        float dieMinZ = Mathf.Max(lower.min.z, upper.min.z);
+        float dieMaxZ = Mathf.Min(lower.max.z, upper.max.z);
+        if (dieMinX >= dieMaxX || dieMinZ >= dieMaxZ)
+        {
+            Fail("折弯机上下模在水平面没有重叠的压制区域");
+            yield break;
+        }
+        Vector3 diePoint = new Vector3((dieMinX + dieMaxX) * 0.5f,
+            lower.center.y, (dieMinZ + dieMaxZ) * 0.5f);
+        diePoint.y = lower.max.y + bendingDieClearance;
+        float approachY = lower.max.y + Mathf.Min(openGap * 0.5f, 0.1f);
+        float sheetHeight = Mathf.Min(GetBounds(sheet).size.y, 0.03f);
+        Vector3 finalHingeLocal = Vector3.zero;
+        for (int edge = 0; edge < edgeOffsets.Length; edge++)
+        {
+            Vector3 localOutward = edgeOffsets[edge].normalized;
+            MeshFilter flapMesh = bendFlaps[edge].GetComponent<MeshFilter>();
+            if (flapMesh == null)
+            {
+                Fail("成品第 " + (edge + 1) + " 边缺少折弯网格");
+                yield break;
+            }
+            Bounds flapLocalBounds = FilterBoundsInRoot(sheet, flapMesh);
+            Vector3 hingeLocal = flapLocalBounds.center
+                - Vector3.Scale(localOutward, flapLocalBounds.extents);
+            finalHingeLocal = hingeLocal;
+            SetState(LoadingState.PositionBendEdge,
+                "吸盘头旋转，将成品第 " + (edge + 1) + "/4 边对准上下模");
+            if (edge == 0)
+            {
+                Vector3 edgeDirection = sheet.TransformDirection(edgeOffsets[edge]);
+                edgeDirection.y = 0f;
+                if (edgeDirection.sqrMagnitude < 0.0001f)
+                {
+                    Fail("成品边缘方向异常，无法定位第 1 边");
+                    yield break;
+                }
+                float yaw = Vector3.SignedAngle(edgeDirection, -outside,
+                    Vector3.up);
+                yield return RotateWristTo(Quaternion.AngleAxis(yaw, Vector3.up)
+                    * armWristRig.rotation);
+            }
+            else
+            {
+                Vector3 fromHinge = sheet.TransformPoint(hingeLocal)
+                    - armWristRig.position;
+                Vector3 toDie = diePoint - armWristRig.position;
+                fromHinge.y = toDie.y = 0f;
+                if (fromHinge.sqrMagnitude < 0.0001f
+                    || toDie.sqrMagnitude < 0.0001f)
+                {
+                    Fail("吸盘旋转中心与第 " + (edge + 1) + " 边铰线重合");
+                    yield break;
+                }
+                float yaw = Vector3.SignedAngle(fromHinge, toDie, Vector3.up);
+                yield return RotateWristTo(Quaternion.AngleAxis(yaw, Vector3.up)
+                    * armWristRig.rotation);
+            }
+            Quaternion wristOrientation = armWristRig.rotation;
+            if (edge == 0)
+            {
+                Vector3 approach = diePoint;
+                approach.y = approachY;
+                yield return MoveArmEdgeTo(hingeLocal, approach, wristOrientation);
+                if (sequence == null) yield break;
+                yield return MoveArmEdgeTo(hingeLocal, diePoint, wristOrientation);
+                if (sequence == null) yield break;
+            }
+            if (Vector3.Distance(sheet.TransformPoint(hingeLocal), diePoint)
+                > positionTolerance * 5f)
+            {
+                Fail("成品第 " + (edge + 1) + " 边的铰线未对准折弯模具");
+                yield break;
+            }
+
+            float stroke = upper.min.y
+                - (lower.max.y + sheetHeight + bendingDieClearance);
+            if (stroke <= positionTolerance)
+            {
+                Fail("上模无法对第 " + (edge + 1) + " 边完成闭合");
+                yield break;
+            }
+            SetState(LoadingState.CloseBendingDie,
+                "r121 带上模 r1565 下压第 " + (edge + 1) + "/4 边");
+            Vector3 hinge = sheet.TransformPoint(hingeLocal);
+            Vector3 foldAxis = Vector3.Cross(
+                sheet.TransformDirection(localOutward), Vector3.up).normalized;
+            Vector3 outerLocal = flapLocalBounds.center
+                + Vector3.Scale(localOutward, flapLocalBounds.extents);
+            Vector3 outerPointOnFlap = bendFlaps[edge].InverseTransformPoint(
+                sheet.TransformPoint(outerLocal));
+            yield return MoveBendingUpper(stroke, bendFlaps[edge], hinge, foldAxis);
+            if (bendFlaps[edge].TransformPoint(outerPointOnFlap).y
+                <= hinge.y + 0.01f)
+            {
+                Fail("成品第 " + (edge + 1) + " 边没有向上折起");
+                yield break;
+            }
+            if (bendingPressHold > 0f)
+                yield return new WaitForSeconds(bendingPressHold);
+            SetState(LoadingState.OpenBendingDie,
+                "折弯机上部抬起，上下模打开");
+            yield return MoveBendingUpper(0f);
+        }
+        Vector3 retract = sheet.TransformPoint(finalHingeLocal)
+            + outside * retractDistance;
+        retract.y = approachY;
+        yield return MoveArmEdgeTo(finalHingeLocal, retract,
+            armWristRig.rotation);
+        if (sequence == null) yield break;
+        yield return RestoreArmPosture(straightPositions, straightRotations,
+            straightScale);
+        yield return RestoreBendingJoints(straightThird, straightFourth,
+            straightSixth, straightWrist);
+        SetState(LoadingState.BendingComplete, "四个突出边缘已依次完成上下模闭合");
+    }
+
+    private IEnumerator DeliverBentPartToHClamps()
+    {
+        if (bentFlaps == null || bentFlaps.Length != 4)
+        {
+            Fail("四边折弯成品缺少立边分件，无法放入 H 夹头");
+            yield break;
+        }
+        Vector3 turntablePoint, turntableNormal;
+        if (!TryGetHTurntablePlane(out turntablePoint, out turntableNormal))
+            yield break;
+        Vector3[] gaps;
+        HClampGap[] clampGaps;
+        float clampTop;
+        if (!TryGetHClampGaps(turntableNormal, out gaps,
+            out clampGaps, out clampTop)) yield break;
+        Vector3 flapCenter = Vector3.zero;
+        foreach (Transform flap in bentFlaps)
+            flapCenter += GetBounds(flap).center;
+        flapCenter *= 0.25f;
+        float flapSide = Vector3.Dot(
+            sheet.InverseTransformPoint(flapCenter) - bentPanelBoundsLocal.center,
+            finishedTopLocalNormal);
+        if (Mathf.Abs(flapSide) < 0.001f)
+        {
+            Fail("四条折弯立边没有离开中心板平面，无法确定朝下方向");
+            yield break;
+        }
+        Vector3 downwardLocalNormal = finishedTopLocalNormal
+            * Mathf.Sign(flapSide);
+        Vector3 panelUnderLocal = bentPanelBoundsLocal.center
+            + Vector3.Scale(downwardLocalNormal,
+                bentPanelBoundsLocal.extents);
+        Vector3 centerLocal = sheet.InverseTransformPoint(flapCenter);
+        float clearance = Mathf.Max(0.01f, hClampApproachClearance);
+        float safeCenterY = Mathf.Max(clampTop, turntablePoint.y)
+            + GetBounds(sheet).extents.magnitude + clearance;
+        if (flapCenter.y < safeCenterY)
+        {
+            Vector3 raised = flapCenter;
+            raised.y = safeCenterY;
+            yield return MoveArmEdgeTo(centerLocal, raised, armWristRig.rotation);
+            if (sequence == null) yield break;
+        }
+        Vector3 productNormal = sheet.TransformDirection(downwardLocalNormal);
+        yield return RotateWristTo(Quaternion.FromToRotation(productNormal,
+            -turntableNormal) * armWristRig.rotation);
+        if (Vector3.Dot(sheet.TransformDirection(downwardLocalNormal),
+            -turntableNormal) < 0.999f)
+        {
+            Fail("四条折弯立边未能朝下指向 H 转台 r726 台面");
+            yield break;
+        }
+
+        Vector3 targetCenter = Vector3.zero;
+        foreach (Vector3 gap in gaps) targetCenter += gap;
+        targetCenter *= 0.25f;
+        Vector3 railAxis;
+        float minimumTravel, maximumTravel;
+        if (!TryGetArmRailLimits(out railAxis, out minimumTravel,
+            out maximumTravel)) yield break;
+        float projectedTravel = Vector3.Dot(targetCenter
+            - sheet.TransformPoint(centerLocal), railAxis);
+        float travel = Mathf.Clamp(projectedTravel, minimumTravel, maximumTravel);
+        SetState(LoadingState.ArmToHClamps,
+            "折弯成品抬高，滑槽基座移向四组 H 夹头");
+        yield return MoveCarrier(armBaseMover, armMovingVisuals,
+            armBaseMover.position + railAxis * travel, armBaseMoveSpeed);
+
+        float yaw;
+        float fitError;
+        if (!TryFitBentFlapsToGaps(gaps, turntableNormal,
+            out yaw, out fitError)) yield break;
+        yield return RotateWristTo(Quaternion.AngleAxis(yaw, turntableNormal)
+            * armWristRig.rotation);
+
+        Vector3[] parkPositions = SavePositions(armMovingVisuals);
+        Quaternion[] parkRotations = SaveRotations(armMovingVisuals);
+        float parkScale = armRig.localScale.x;
+        Vector3 approach;
+        if (!TryBentFlapPlacementTarget(targetCenter, turntablePoint,
+                turntableNormal, centerLocal, out approach)) yield break;
+        approach += turntableNormal * clearance;
+        approach.y = Mathf.Max(approach.y,
+            clampTop + sheet.TransformPoint(centerLocal).y
+            - GetBounds(sheet).min.y + clearance);
+        Quaternion orientation = armWristRig.rotation;
+        yield return MoveArmEdgeTo(centerLocal, approach, orientation);
+        if (sequence == null) yield break;
+        if (!TryBentFlapPlacementTarget(targetCenter, turntablePoint,
+                turntableNormal, centerLocal, out targetCenter)) yield break;
+        SetState(LoadingState.PlaceBentPartInHClamps,
+            "四条立边朝下落在 H 转台台面并进入夹头间隙");
+        yield return MoveArmEdgeTo(centerLocal, targetCenter, orientation);
+        if (sequence == null) yield break;
+        for (int correction = 0; correction < 3; correction++)
+        {
+            float lowest;
+            if (!TryGetLowestBentFlapProjection(turntableNormal,
+                    out lowest)) yield break;
+            float gap = lowest - Vector3.Dot(turntablePoint,
+                turntableNormal);
+            if (Mathf.Abs(gap - 0.002f) <= 0.004f) break;
+            targetCenter = sheet.TransformPoint(centerLocal)
+                + turntableNormal * (0.002f - gap);
+            yield return MoveArmEdgeTo(centerLocal, targetCenter, orientation);
+            if (sequence == null) yield break;
+        }
+        float lowestFlap;
+        if (!TryGetLowestBentFlapProjection(turntableNormal,
+                out lowestFlap)) yield break;
+        float bottomGap = lowestFlap - Vector3.Dot(turntablePoint,
+            turntableNormal);
+        float protrusion;
+        if (!AreBentFlapsInsideGaps(clampGaps, out protrusion))
+        {
+            Fail("成品立边未全部进入四组 H 夹头间隙（最大越界 "
+                + protrusion.ToString("F3") + "m），已保留在吸盘上");
+            yield break;
+        }
+        if (Mathf.Abs(bottomGap - 0.002f) > 0.01f
+            || Vector3.Dot(sheet.TransformDirection(downwardLocalNormal),
+                -turntableNormal) < 0.999f)
+        {
+            Fail("折弯立边末端未落在 H 转台 r726 台面，已保留在吸盘上");
+            yield break;
+        }
+        float panelUnderHeight = Vector3.Dot(
+            sheet.TransformPoint(panelUnderLocal) - turntablePoint,
+            turntableNormal);
+        if (panelUnderHeight < 0.01f)
+        {
+            Fail("中心板没有被四条向下的立边撑在台面上方，已保留在吸盘上");
+            yield break;
+        }
+        for (int i = 0; i < bentFlaps.Length; i++)
+        {
+            float lowest, highest;
+            if (!TryGetProjectedMeshInterval(bentFlaps[i], turntableNormal,
+                    out lowest, out highest)
+                || Mathf.Abs(lowest - Vector3.Dot(turntablePoint,
+                    turntableNormal) - 0.002f) > 0.015f
+                || highest < lowest + 0.01f)
+            {
+                Fail("第 " + (i + 1)
+                    + " 条折弯立边没有向下立在 H 转台台面，已保留在吸盘上");
+                yield break;
+            }
+        }
+        ReparentWithoutJump(workpieceRoot, workpieceHomeParent);
+        bentFlaps = null;
+        yield return MoveArmSuctionTo(SuctionContactPoint()
+            + Vector3.up * (GetBounds(sheet).size.y + clearance));
+        yield return RestoreArmPosture(parkPositions, parkRotations, parkScale);
+
+        Vector3 rightEnd;
+        if (!TryGetArmRailRightEnd(out rightEnd)) yield break;
+        SetState(LoadingState.ArmReturnToRailEnd,
+            "成品留在 H 夹头内，机械臂沿长滑槽返回右端等待");
+        yield return MoveCarrier(armBaseMover, armMovingVisuals,
+            rightEnd, armBaseMoveSpeed);
+    }
+
+    private bool TryGetHClampGaps(Vector3 surfaceNormal,
+        out Vector3[] gaps, out HClampGap[] spaces, out float top)
+    {
+        int[,] ids = { { 1563, 1564 }, { 1560, 1553 },
+            { 1556, 1562 }, { 1559, 1561 } };
+        gaps = new Vector3[4];
+        spaces = new HClampGap[4];
+        top = float.NegativeInfinity;
+        for (int i = 0; i < 4; i++)
+        {
+            Transform a = FindModelNode(ids[i, 0]);
+            Transform b = FindModelNode(ids[i, 1]);
+            if (a == null || b == null)
+                return Fail("缺少第 " + (i + 1) + " 组 H 夹头模型");
+            if (a.GetComponentInChildren<Renderer>() == null
+                || b.GetComponentInChildren<Renderer>() == null)
+                return Fail("第 " + (i + 1) + " 组 H 夹头缺少可测量的网格");
+            Bounds first = GetBounds(a);
+            Bounds second = GetBounds(b);
+            Vector3 direction = second.center - first.center;
+            direction.y = 0f;
+            if (direction.sqrMagnitude < 0.000001f)
+                return Fail("第 " + (i + 1) + " 组 H 夹头没有水平间隙");
+            direction.Normalize();
+            Vector3 faceA = first.center
+                + direction * HorizontalRadius(first, direction);
+            Vector3 faceB = second.center
+                - direction * HorizontalRadius(second, direction);
+            if (Vector3.Dot(faceB - faceA, direction) <= 0f)
+                return Fail("第 " + (i + 1) + " 组 H 夹头相向表面重叠");
+            gaps[i] = (faceA + faceB) * 0.5f;
+            Vector3 tangent = Vector3.Cross(surfaceNormal, direction).normalized;
+            spaces[i].direction = direction;
+            spaces[i].near = Vector3.Dot(faceA, direction);
+            spaces[i].far = Vector3.Dot(faceB, direction);
+            spaces[i].tangent = tangent;
+            spaces[i].tangentMin = Mathf.Max(
+                Vector3.Dot(first.center, tangent)
+                    - HorizontalRadius(first, tangent),
+                Vector3.Dot(second.center, tangent)
+                    - HorizontalRadius(second, tangent));
+            spaces[i].tangentMax = Mathf.Min(
+                Vector3.Dot(first.center, tangent)
+                    + HorizontalRadius(first, tangent),
+                Vector3.Dot(second.center, tangent)
+                    + HorizontalRadius(second, tangent));
+            float sharedBottom = Mathf.Max(first.min.y, second.min.y);
+            float sharedTop = Mathf.Min(first.max.y, second.max.y);
+            gaps[i].y = sharedBottom <= sharedTop
+                ? (sharedBottom + sharedTop) * 0.5f
+                : (first.center.y + second.center.y) * 0.5f;
+            spaces[i].center = gaps[i];
+            top = Mathf.Max(top, first.max.y, second.max.y);
+        }
+        return true;
+    }
+
+    private bool AreBentFlapsInsideGaps(HClampGap[] spaces,
+        out float protrusion)
+    {
+        protrusion = float.PositiveInfinity;
+        if (bentFlaps == null || bentFlaps.Length != 4
+            || spaces == null || spaces.Length != 4) return false;
+        for (int a = 0; a < 4; a++)
+        for (int b = 0; b < 4; b++)
+        for (int c = 0; c < 4; c++)
+        for (int d = 0; d < 4; d++)
+        {
+            if (a == b || a == c || a == d || b == c || b == d || c == d)
+                continue;
+            int[] assignment = { a, b, c, d };
+            float worst = 0f;
+            for (int i = 0; i < 4; i++)
+            {
+                HClampGap space = spaces[assignment[i]];
+                float low, high, sideLow, sideHigh;
+                if (!TryGetProjectedMeshInterval(bentFlaps[i],
+                        space.direction, out low, out high)
+                    || !TryGetProjectedMeshInterval(bentFlaps[i],
+                        space.tangent, out sideLow, out sideHigh))
+                    return false;
+                worst = Mathf.Max(worst, space.near - low, high - space.far);
+                if (space.tangentMin <= space.tangentMax)
+                    worst = Mathf.Max(worst,
+                        space.tangentMin - sideHigh,
+                        sideLow - space.tangentMax);
+            }
+            protrusion = Mathf.Min(protrusion, worst);
+        }
+        return protrusion <= 0.005f;
+    }
+
+    private static bool TryGetProjectedMeshInterval(Transform root,
+        Vector3 axis, out float minimum, out float maximum)
+    {
+        minimum = float.PositiveInfinity;
+        maximum = float.NegativeInfinity;
+        foreach (MeshFilter filter in root.GetComponentsInChildren<MeshFilter>(true))
+        {
+            if (filter.sharedMesh == null) continue;
+            Bounds mesh = filter.sharedMesh.bounds;
+            for (int x = -1; x <= 1; x += 2)
+            for (int y = -1; y <= 1; y += 2)
+            for (int z = -1; z <= 1; z += 2)
+            {
+                Vector3 corner = mesh.center + Vector3.Scale(mesh.extents,
+                    new Vector3(x, y, z));
+                float position = Vector3.Dot(
+                    filter.transform.TransformPoint(corner), axis);
+                minimum = Mathf.Min(minimum, position);
+                maximum = Mathf.Max(maximum, position);
+            }
+        }
+        return !float.IsInfinity(minimum);
+    }
+
+    private bool TryGetHTurntablePlane(out Vector3 point, out Vector3 normal)
+    {
+        point = Vector3.zero;
+        normal = Vector3.up;
+        Transform turntable = FindModelNode(726);
+        if (turntable == null)
+            return Fail("缺少 H 转台 r726，无法确定成品底面姿态");
+        MeshFilter filter = turntable.GetComponent<MeshFilter>();
+        if (filter == null)
+            filter = turntable.GetComponentInChildren<MeshFilter>();
+        if (filter == null || filter.sharedMesh == null)
+            return Fail("H 转台 r726 缺少可测量的台面网格");
+        Bounds mesh = filter.sharedMesh.bounds;
+        Vector3 localNormal = mesh.size.x < mesh.size.y
+            ? (mesh.size.x < mesh.size.z ? Vector3.right : Vector3.forward)
+            : (mesh.size.y < mesh.size.z ? Vector3.up : Vector3.forward);
+        normal = filter.transform.TransformDirection(localNormal).normalized;
+        if (Vector3.Dot(normal, Vector3.up) < 0f)
+        {
+            normal = -normal;
+            localNormal = -localNormal;
+        }
+        if (Vector3.Dot(normal, Vector3.up) < 0.5f)
+            return Fail("H 转台 r726 的台面法线不是朝上的平面");
+        point = filter.transform.TransformPoint(mesh.center
+            + Vector3.Scale(localNormal, mesh.extents));
+        return true;
+    }
+
+    private bool TryBentFlapPlacementTarget(Vector3 gapCenter,
+        Vector3 surfacePoint, Vector3 surfaceNormal, Vector3 centerLocal,
+        out Vector3 target)
+    {
+        target = gapCenter;
+        float lowest;
+        if (!TryGetLowestBentFlapProjection(surfaceNormal, out lowest))
+            return Fail("无法读取四条折弯立边的最低点");
+        Vector3 currentCenter = sheet.TransformPoint(centerLocal);
+        float correction = Vector3.Dot(surfacePoint, surfaceNormal)
+            + 0.002f - lowest
+            - Vector3.Dot(gapCenter - currentCenter, surfaceNormal);
+        target = gapCenter + surfaceNormal * correction;
+        return true;
+    }
+
+    private bool TryGetLowestBentFlapProjection(Vector3 axis,
+        out float lowest)
+    {
+        lowest = float.PositiveInfinity;
+        foreach (Transform flap in bentFlaps)
+        {
+            float minimum, maximum;
+            if (!TryGetProjectedMeshInterval(flap, axis,
+                out minimum, out maximum)) return false;
+            lowest = Mathf.Min(lowest, minimum);
+        }
+        return !float.IsInfinity(lowest);
+    }
+
+    private bool TryFitBentFlapsToGaps(Vector3[] gaps, Vector3 planeNormal,
+        out float yaw,
+        out float error, bool allowRotation = true)
+    {
+        yaw = 0f;
+        error = float.PositiveInfinity;
+        if (bentFlaps == null || bentFlaps.Length != 4) return false;
+        Vector3[] source = new Vector3[4];
+        Vector3 sourceCenter = Vector3.zero;
+        Vector3 gapCenter = Vector3.zero;
+        for (int i = 0; i < 4; i++)
+        {
+            source[i] = GetBounds(bentFlaps[i]).center;
+            sourceCenter += source[i];
+            gapCenter += gaps[i];
+        }
+        sourceCenter *= 0.25f;
+        gapCenter *= 0.25f;
+        for (int a = 0; a < 4; a++)
+        for (int b = 0; b < 4; b++)
+        for (int c = 0; c < 4; c++)
+        for (int d = 0; d < 4; d++)
+        {
+            if (a == b || a == c || a == d || b == c || b == d || c == d)
+                continue;
+            int[] assignment = { a, b, c, d };
+            float dot = 0f, cross = 0f;
+            for (int i = 0; i < 4; i++)
+            {
+                Vector3 from = Vector3.ProjectOnPlane(
+                    source[i] - sourceCenter, planeNormal);
+                Vector3 to = Vector3.ProjectOnPlane(
+                    gaps[assignment[i]] - gapCenter, planeNormal);
+                dot += Vector3.Dot(from, to);
+                cross += Vector3.Dot(Vector3.Cross(from, to), planeNormal);
+            }
+            float angle = allowRotation
+                ? Mathf.Atan2(cross, dot) * Mathf.Rad2Deg : 0f;
+            Quaternion rotation = Quaternion.AngleAxis(angle, planeNormal);
+            float squaredError = 0f;
+            for (int i = 0; i < 4; i++)
+            {
+                Vector3 difference = Vector3.ProjectOnPlane(
+                    rotation * (source[i] - sourceCenter)
+                    - (gaps[assignment[i]] - gapCenter), planeNormal);
+                squaredError += difference.sqrMagnitude;
+            }
+            float candidate = Mathf.Sqrt(squaredError * 0.25f);
+            if (candidate >= error) continue;
+            error = candidate;
+            yaw = angle;
+        }
+        return !float.IsInfinity(error);
+    }
+
+    private bool TryGetArmRailRightEnd(out Vector3 destination)
+    {
+        destination = armBaseMover.position;
+        Vector3 axis;
+        float minimumTravel, maximumTravel;
+        if (!TryGetArmRailLimits(out axis, out minimumTravel,
+            out maximumTravel)) return false;
+        Vector3 first = destination + axis * minimumTravel;
+        Vector3 second = destination + axis * maximumTravel;
+        if (Mathf.Abs(first.x - second.x) > 0.05f)
+            destination = first.x < second.x ? first : second;
+        else
+        {
+            Vector3 table = punchTable.bounds.center;
+            destination = Vector3.Distance(first, table)
+                > Vector3.Distance(second, table) ? first : second;
+        }
+        return true;
+    }
+
+    private IEnumerator ArticulateArmForBending(Vector3 axis, Vector3 outside)
+    {
+        Quaternion startThird = armThirdJoint.localRotation;
+        Quaternion startFourth = armFourthJoint.localRotation;
+        Quaternion startSixth = armSixthJoint.localRotation;
+        float thirdDirection = Vector3.Dot(Vector3.Cross(axis,
+            armFourthJoint.position - armThirdJoint.position), outside);
+        float thirdAngle = (thirdDirection >= 0f ? 1f : -1f)
+            * armThirdLinkBackAngle;
+        armThirdJoint.RotateAround(armThirdJoint.position, axis, thirdAngle);
+        float fourthDirection = Vector3.Dot(Vector3.Cross(axis,
+            armSixthJoint.position - armFourthJoint.position), -outside);
+        float fourthAngle = (fourthDirection >= 0f ? 1f : -1f)
+            * armFourthLinkForwardAngle;
+        armFourthJoint.RotateAround(armFourthJoint.position, axis, fourthAngle);
+        Vector3 cupCenter, cupNormal;
+        GetCupTipPlane(out cupCenter, out cupNormal);
+        Vector3 projectedNormal = Vector3.ProjectOnPlane(cupNormal, axis);
+        if (projectedNormal.sqrMagnitude < 0.000001f)
+        {
+            armFourthJoint.localRotation = startFourth;
+            armThirdJoint.localRotation = startThird;
+            Fail("吸盘末端平面与 r839 转轴平行，无法确定翻转角度");
+            yield break;
+        }
+        float sixthAngle = Vector3.SignedAngle(projectedNormal, Vector3.up, axis);
+        Vector3 stemOffset = GetBounds(armWristStem).center - armSixthJoint.position;
+        float liftDirection = Vector3.Cross(axis, stemOffset).y;
+        if (Mathf.Abs(Mathf.Abs(sixthAngle) - 180f) < 0.01f)
+            sixthAngle = (liftDirection >= 0f ? 1f : -1f) * 180f;
+        armSixthJoint.localRotation = startSixth;
+        armFourthJoint.localRotation = startFourth;
+        armThirdJoint.localRotation = startThird;
+        float duration = Mathf.Max(Mathf.Abs(thirdAngle), Mathf.Abs(fourthAngle),
+            Mathf.Abs(sixthAngle)) / Mathf.Max(1f, armRotationSpeed);
+        duration = Mathf.Max(duration, 0.01f);
+        float fraction = 0f;
+        while (fraction < 1f)
+        {
+            float next = Mathf.Min(1f, fraction + Time.deltaTime / duration);
+            float step = next - fraction;
+            armThirdJoint.RotateAround(armThirdJoint.position, axis,
+                thirdAngle * step);
+            armFourthJoint.RotateAround(armFourthJoint.position, axis,
+                fourthAngle * step);
+            armSixthJoint.RotateAround(armSixthJoint.position, axis,
+                sixthAngle * step);
+            fraction = next;
+            yield return null;
+        }
+        GetCupTipPlane(out cupCenter, out cupNormal);
+        if (Vector3.Dot(cupNormal, Vector3.up) < 0.999f)
+        {
+            Quaternion wristTarget = Quaternion.FromToRotation(cupNormal,
+                Vector3.up) * armWristRig.rotation;
+            yield return RotateWristTo(wristTarget);
+        }
+        GetCupTipPlane(out cupCenter, out cupNormal);
+        Vector3 faceNormal = sheet.TransformDirection(finishedTopLocalNormal);
+        float lowestTip = float.PositiveInfinity;
+        float highestTip = float.NegativeInfinity;
+        for (int i = 0; i < cupTipLocalPoints.Length; i++)
+        {
+            float height = armWristRig.TransformPoint(cupTipLocalPoints[i]).y;
+            lowestTip = Mathf.Min(lowestTip, height);
+            highestTip = Mathf.Max(highestTip, height);
+        }
+        if (Vector3.Dot(cupNormal, Vector3.up) < 0.995f
+            || Vector3.Dot(faceNormal, cupNormal) > -0.995f
+            || highestTip - lowestTip > 0.005f)
+            Fail("翻转后四个吸盘末端与成品板面没有共同保持水平");
+    }
+
+    private IEnumerator RotateWristTo(Quaternion target)
+    {
+        while (Quaternion.Angle(armWristRig.rotation, target) > 0.01f)
+        {
+            armWristRig.rotation = Quaternion.RotateTowards(armWristRig.rotation,
+                target, armRotationSpeed * Time.deltaTime);
+            yield return null;
+        }
+        armWristRig.rotation = target;
+    }
+
+    private IEnumerator RestoreBendingJoints(Quaternion third, Quaternion fourth,
+        Quaternion sixth, Quaternion wrist)
+    {
+        while (Quaternion.Angle(armThirdJoint.localRotation, third) > 0.01f
+            || Quaternion.Angle(armFourthJoint.localRotation, fourth) > 0.01f
+            || Quaternion.Angle(armSixthJoint.localRotation, sixth) > 0.01f
+            || Quaternion.Angle(armWristRig.localRotation, wrist) > 0.01f)
+        {
+            float step = armRotationSpeed * Time.deltaTime;
+            armThirdJoint.localRotation = Quaternion.RotateTowards(
+                armThirdJoint.localRotation, third, step);
+            armFourthJoint.localRotation = Quaternion.RotateTowards(
+                armFourthJoint.localRotation, fourth, step);
+            armSixthJoint.localRotation = Quaternion.RotateTowards(
+                armSixthJoint.localRotation, sixth, step);
+            armWristRig.localRotation = Quaternion.RotateTowards(
+                armWristRig.localRotation, wrist, step);
+            yield return null;
+        }
+        armThirdJoint.localRotation = third;
+        armFourthJoint.localRotation = fourth;
+        armSixthJoint.localRotation = sixth;
+        armWristRig.localRotation = wrist;
+    }
+
+    private bool CacheCupTipPlane()
+    {
+        cupTipLocalPoints = new Vector3[4];
+        Vector3 cupCenter = Vector3.zero;
+        for (int i = 0; i < 4; i++)
+            cupCenter += GetBounds(armWristVisuals[i + 2]).center;
+        cupCenter *= 0.25f;
+        Vector3 outward = cupCenter - GetBounds(armWristVisuals[1]).center;
+        if (outward.sqrMagnitude < 0.000001f)
+            outward = cupCenter - GetBounds(armWristStem).center;
+        if (outward.sqrMagnitude < 0.000001f)
+            return Fail("无法确定四个机械臂吸盘的末端方向");
+        outward.Normalize();
+        for (int i = 0; i < 4; i++)
+        {
+            Vector3 tip;
+            if (!TryFindCupTip(armWristVisuals[i + 2], outward, out tip))
+                return Fail("无法读取机械臂吸盘末端网格 r"
+                    + new[] { 860, 866, 867, 868 }[i]);
+            cupTipLocalPoints[i] = armWristRig.InverseTransformPoint(tip);
+        }
+        Vector3 center, normal;
+        GetCupTipPlane(out center, out normal);
+        return normal.sqrMagnitude > 0.5f
+            || Fail("四个机械臂吸盘末端无法确定一个平面");
+    }
+
+    private static bool TryFindCupTip(Transform cup, Vector3 outward,
+        out Vector3 tip)
+    {
+        tip = Vector3.zero;
+        float min = float.PositiveInfinity;
+        float max = float.NegativeInfinity;
+        MeshFilter[] filters = cup.GetComponentsInChildren<MeshFilter>(true);
+        foreach (MeshFilter filter in filters)
+        {
+            Mesh mesh = filter.sharedMesh;
+            if (mesh == null || !mesh.isReadable) continue;
+            foreach (Vector3 vertex in mesh.vertices)
+            {
+                float projection = Vector3.Dot(filter.transform.TransformPoint(vertex),
+                    outward);
+                min = Mathf.Min(min, projection);
+                max = Mathf.Max(max, projection);
+            }
+        }
+        if (float.IsInfinity(max)) return false;
+        float threshold = max - Mathf.Max((max - min) * 0.01f, 0.0001f);
+        int count = 0;
+        foreach (MeshFilter filter in filters)
+        {
+            Mesh mesh = filter.sharedMesh;
+            if (mesh == null || !mesh.isReadable) continue;
+            foreach (Vector3 vertex in mesh.vertices)
+            {
+                Vector3 point = filter.transform.TransformPoint(vertex);
+                if (Vector3.Dot(point, outward) < threshold) continue;
+                tip += point;
+                count++;
+            }
+        }
+        if (count == 0) return false;
+        tip /= count;
+        return true;
+    }
+
+    private void GetCupTipPlane(out Vector3 center, out Vector3 normal)
+    {
+        Vector3[] tips = new Vector3[4];
+        center = Vector3.zero;
+        for (int i = 0; i < 4; i++)
+        {
+            tips[i] = armWristRig.TransformPoint(cupTipLocalPoints[i]);
+            center += tips[i];
+        }
+        center *= 0.25f;
+        normal = Vector3.Cross(tips[2] - tips[3], tips[1] - tips[0]);
+        if (normal.sqrMagnitude < 0.000001f)
+            normal = Vector3.Cross(tips[2] - tips[0], tips[3] - tips[0]);
+        if (normal.sqrMagnitude < 0.000001f) return;
+        normal.Normalize();
+        Vector3 outward = center - GetBounds(armWristVisuals[1]).center;
+        if (Vector3.Dot(normal, outward) < 0f) normal = -normal;
+    }
+
+    private bool AlignFinishedPartWithCupTips()
+    {
+        Bounds local;
+        if (!TryGetLocalMeshBounds(sheet, out local))
+            return Fail("冲压成品缺少可对齐吸盘的板面网格");
+        Vector3 center, cupNormal;
+        GetCupTipPlane(out center, out cupNormal);
+        if (cupNormal.sqrMagnitude < 0.5f)
+            return Fail("四个机械臂吸盘末端平面无效");
+        Vector3 faceLocal = local.center
+            + Vector3.Scale(finishedTopLocalNormal, local.extents);
+        Vector3 faceNormal = sheet.TransformDirection(finishedTopLocalNormal);
+        sheet.rotation = Quaternion.FromToRotation(faceNormal, -cupNormal)
+            * sheet.rotation;
+        sheet.position += center + cupNormal * 0.001f
+            - sheet.TransformPoint(faceLocal);
+        return true;
+    }
+
+    private IEnumerator MoveArmEdgeTo(Vector3 localEdge, Vector3 targetEdge,
+        Quaternion wristOrientation)
+    {
+        Vector3 currentEdge = sheet.TransformPoint(localEdge);
+        if (Vector3.Distance(currentEdge, targetEdge) <= positionTolerance * 2f)
+            yield break;
+        Vector3 pivot = armRig.position;
+        Vector3 currentWrist = armWristRig.position - pivot;
+        float startScale = armRig.localScale.x;
+        if (currentWrist.sqrMagnitude < 0.000001f || startScale < 0.0001f)
+        {
+            Fail("机械臂无法保持基座连接并对准折弯模具");
+            yield break;
+        }
+        // The wrist keeps a fixed world orientation while the arm rig turns.
+        // Solve its uniform scale and rotation from the requested edge point.
+        Vector3 edgeOffsetPerScale = (currentEdge - armWristRig.position) / startScale;
+        Vector3 wristOffsetPerScale = currentWrist / startScale;
+        Vector3 desired = targetEdge - pivot;
+        float a = edgeOffsetPerScale.sqrMagnitude - wristOffsetPerScale.sqrMagnitude;
+        float b = -2f * Vector3.Dot(desired, edgeOffsetPerScale);
+        float c = desired.sqrMagnitude;
+        float targetScale;
+        if (Mathf.Abs(a) < 0.000001f)
+        {
+            if (Mathf.Abs(b) < 0.000001f)
+            {
+                Fail("折弯边缘目标超出机械臂可解范围");
+                yield break;
+            }
+            targetScale = -c / b;
+        }
+        else
+        {
+            float discriminant = b * b - 4f * a * c;
+            if (discriminant < 0f)
+            {
+                Fail("折弯边缘目标超出机械臂可解范围");
+                yield break;
+            }
+            float root = Mathf.Sqrt(discriminant);
+            float first = (-b + root) / (2f * a);
+            float second = (-b - root) / (2f * a);
+            targetScale = first > 0f && (second <= 0f
+                || Mathf.Abs(first - startScale) < Mathf.Abs(second - startScale))
+                ? first : second;
+        }
+        if (targetScale < 0.05f || targetScale > 4f)
+        {
+            Fail("折弯边缘目标需要异常的机械臂比例");
+            yield break;
+        }
+        Vector3 targetWrist = desired - edgeOffsetPerScale * targetScale;
+        Quaternion startRotation = armRig.rotation;
+        Quaternion targetRotation = Quaternion.FromToRotation(currentWrist,
+            targetWrist) * startRotation;
+        float duration = Mathf.Max(Vector3.Distance(currentEdge, targetEdge)
+                / armPickupSpeed,
+            Quaternion.Angle(startRotation, targetRotation) / armRotationSpeed,
+            0.01f);
+        float elapsed = 0f;
+        while (elapsed < duration)
+        {
+            elapsed = Mathf.Min(duration, elapsed + Time.deltaTime);
+            float t = elapsed / duration;
+            armRig.rotation = Quaternion.Slerp(startRotation, targetRotation, t);
+            armRig.localScale = Vector3.one * Mathf.Lerp(startScale, targetScale, t);
+            armWristRig.rotation = wristOrientation;
+            yield return null;
+        }
+        armRig.rotation = targetRotation;
+        armRig.localScale = Vector3.one * targetScale;
+        armWristRig.rotation = wristOrientation;
+    }
+
+    private IEnumerator MoveBendingUpper(float travel, Transform flap = null,
+        Vector3 hinge = default(Vector3), Vector3 foldAxis = default(Vector3))
+    {
+        Vector3 destination = bendingUpperHomePositions[0] + Vector3.down * travel;
+        float totalTravel = Vector3.Distance(bendingUpper.position, destination);
+        float folded = 0f;
+        while (Vector3.Distance(bendingUpper.position, destination) > positionTolerance)
+        {
+            Vector3 next = Vector3.MoveTowards(bendingUpper.position, destination,
+                bendingPressSpeed * Time.deltaTime);
+            Vector3 delta = next - bendingUpper.position;
+            bendingUpper.position = next;
+            if (!bendingUpperMold.IsChildOf(bendingUpper))
+                bendingUpperMold.position += delta;
+            if (flap != null && totalTravel > 0.0001f)
+            {
+                float nextFold = 90f * (1f - Vector3.Distance(next, destination)
+                    / totalTravel);
+                flap.RotateAround(hinge, foldAxis, nextFold - folded);
+                folded = nextFold;
+            }
+            yield return null;
+        }
+        Vector3 remainder = destination - bendingUpper.position;
+        bendingUpper.position = destination;
+        if (!bendingUpperMold.IsChildOf(bendingUpper))
+            bendingUpperMold.position += remainder;
+        if (flap != null) flap.RotateAround(hinge, foldAxis, 90f - folded);
+    }
+
+    private bool ReplaceWithBendingParts()
+    {
+        if (bendingPiecePrefabs == null || bendingPiecePrefabs.Length != 5
+            || System.Array.Exists(bendingPiecePrefabs, prefab => prefab == null))
+            return Fail("缺少加工零件 冲压完毕1–5.fbx 五块折弯分件模型");
+        Bounds original = GetBounds(sheet);
+        Transform previous = sheet;
+        Vector3 previousFaceNormal = previous.TransformDirection(finishedTopLocalNormal);
+        GameObject split = new GameObject("BendingPart");
+        split.transform.SetParent(workpieceRoot, false);
+        Transform[] sections = new Transform[bendingPiecePrefabs.Length];
+        for (int i = 0; i < bendingPiecePrefabs.Length; i++)
+        {
+            GameObject piece = Instantiate(bendingPiecePrefabs[i], split.transform, false);
+            piece.name = "FinishedPartSection" + (i + 1);
+            sections[i] = piece.transform;
+        }
+        if (!AlignThirdBendingSection(split.transform, sections[0], sections[2]))
+        {
+            Destroy(split);
+            return Fail("冲压完毕3.fbx 无法与中心板边界对齐");
+        }
+        split.transform.position = previous.position;
+        split.transform.rotation = previous.rotation;
+        Bounds splitBounds = GetBounds(split.transform);
+        float oldWidth = Mathf.Max(original.size.x, original.size.z);
+        float newWidth = Mathf.Max(splitBounds.size.x, splitBounds.size.z);
+        if (newWidth < 0.0001f)
+        {
+            Destroy(split);
+            return Fail("折弯分件模型没有有效的网格边界");
+        }
+        split.transform.localScale *= oldWidth / newWidth;
+        splitBounds = GetBounds(split.transform);
+        split.transform.position += original.center - splitBounds.center;
+        sheet = split.transform;
+        Bounds localSplit;
+        if (TryGetLocalMeshBounds(sheet, out localSplit))
+        {
+            Vector3 e = localSplit.extents;
+            finishedTopLocalNormal = e.x < e.y
+                ? (e.x < e.z ? Vector3.right : Vector3.forward)
+                : (e.y < e.z ? Vector3.up : Vector3.forward);
+            if (Vector3.Dot(sheet.TransformDirection(finishedTopLocalNormal),
+                previousFaceNormal) < 0f)
+                finishedTopLocalNormal = -finishedTopLocalNormal;
+        }
+        if (!AlignFinishedPartWithCupTips())
+        {
+            sheet = previous;
+            Destroy(split);
+            return false;
+        }
+        previous.gameObject.SetActive(false);
+        ApplyWorkpieceColor(sheet);
+        Destroy(previous.gameObject);
+        return true;
+    }
+
+    private static bool AlignThirdBendingSection(Transform assembly,
+        Transform panel, Transform thirdSection)
+    {
+        MeshFilter panelMesh = panel.GetComponentInChildren<MeshFilter>(true);
+        MeshFilter sectionMesh = thirdSection.GetComponentInChildren<MeshFilter>(true);
+        if (panelMesh == null || sectionMesh == null
+            || panelMesh.sharedMesh == null || sectionMesh.sharedMesh == null)
+            return false;
+        Bounds panelBounds = FilterBoundsInRoot(assembly, panelMesh);
+        Bounds sectionBounds = FilterBoundsInRoot(assembly, sectionMesh);
+        Vector3 separation = sectionBounds.center - panelBounds.center;
+        float x = Mathf.Abs(separation.x);
+        float y = Mathf.Abs(separation.y);
+        float z = Mathf.Abs(separation.z);
+        Vector3 outward = x >= y && x >= z ? Vector3.right
+            : y >= z ? Vector3.up : Vector3.forward;
+        if (Vector3.Dot(separation, outward) < 0f) outward = -outward;
+        float panelEdge = Vector3.Dot(panelBounds.center, outward)
+            + Vector3.Dot(panelBounds.extents, Abs(outward));
+        float sectionInnerEdge = Vector3.Dot(sectionBounds.center, outward)
+            - Vector3.Dot(sectionBounds.extents, Abs(outward));
+        float correction = panelEdge - sectionInnerEdge;
+        if (Mathf.Abs(correction) > panelBounds.size.magnitude * 0.01f)
+            thirdSection.localPosition += outward * correction;
+        return true;
+    }
+
+    private static Vector3 Abs(Vector3 value)
+    {
+        return new Vector3(Mathf.Abs(value.x), Mathf.Abs(value.y),
+            Mathf.Abs(value.z));
+    }
+
+    private bool TryFindBendingFlaps(Vector3[] directions,
+        out Transform[] flaps, out Bounds centerPanel)
+    {
+        flaps = new Transform[directions.Length];
+        centerPanel = new Bounds();
+        MeshFilter[] filters = sheet.GetComponentsInChildren<MeshFilter>(true);
+        MeshFilter central = null;
+        float greatestArea = 0f;
+        foreach (MeshFilter filter in filters)
+        {
+            if (filter.sharedMesh == null || !filter.gameObject.activeInHierarchy) continue;
+            Bounds b = FilterBoundsInRoot(sheet, filter);
+            Vector3 size = b.size;
+            float[] dimensions = { size.x, size.y, size.z };
+            System.Array.Sort(dimensions);
+            float area = dimensions[1] * dimensions[2];
+            if (area <= greatestArea) continue;
+            greatestArea = area;
+            central = filter;
+            centerPanel = b;
+        }
+        if (central == null) return false;
+        System.Collections.Generic.HashSet<MeshFilter> used =
+            new System.Collections.Generic.HashSet<MeshFilter> { central };
+        for (int edge = 0; edge < directions.Length; edge++)
+        {
+            MeshFilter best = null;
+            float bestProjection = 0f;
+            foreach (MeshFilter filter in filters)
+            {
+                if (filter.sharedMesh == null || used.Contains(filter)
+                    || !filter.gameObject.activeInHierarchy) continue;
+                float projection = Vector3.Dot(
+                    FilterBoundsInRoot(sheet, filter).center - centerPanel.center,
+                    directions[edge].normalized);
+                if (projection <= bestProjection) continue;
+                bestProjection = projection;
+                best = filter;
+            }
+            if (best == null) return false;
+            flaps[edge] = best.transform;
+            used.Add(best);
+        }
+        return true;
+    }
+
+    private static Bounds FilterBoundsInRoot(Transform root, MeshFilter filter)
+    {
+        Bounds mesh = filter.sharedMesh.bounds;
+        Bounds result = new Bounds();
+        bool found = false;
+        for (int x = -1; x <= 1; x += 2)
+            for (int y = -1; y <= 1; y += 2)
+                for (int z = -1; z <= 1; z += 2)
+                {
+                    Vector3 local = root.InverseTransformPoint(
+                        filter.transform.TransformPoint(mesh.center
+                            + Vector3.Scale(mesh.extents, new Vector3(x, y, z))));
+                    if (!found) { result = new Bounds(local, Vector3.zero); found = true; }
+                    else result.Encapsulate(local);
+                }
+        return result;
+    }
+
+    private static bool TryGetLocalMeshBounds(Transform root, out Bounds bounds)
+    {
+        bounds = new Bounds();
+        bool found = false;
+        foreach (MeshFilter filter in root.GetComponentsInChildren<MeshFilter>(true))
+        {
+            if (filter.sharedMesh == null || !filter.gameObject.activeInHierarchy) continue;
+            Bounds part = FilterBoundsInRoot(root, filter);
+            if (!found) { bounds = part; found = true; }
+            else bounds.Encapsulate(part);
+        }
+        return found;
     }
 
     private bool TryGetArmRailEnd(out Vector3 destination)
@@ -777,20 +1883,20 @@ public sealed class LoadingProcessController : MonoBehaviour
         return true;
     }
 
-    private bool TryGetArmRailPositionForProbe(out Vector3 destination)
+    private bool TryGetArmRailPositionForBendingMold(out Vector3 destination)
     {
         destination = armBaseMover.position;
         Vector3 axis;
         float minimumTravel, maximumTravel;
         if (!TryGetArmRailLimits(out axis, out minimumTravel, out maximumTravel))
             return false;
-        float projectedTravel = Vector3.Dot(GetBounds(bendingProbe).center
+        float projectedTravel = Vector3.Dot(GetBounds(bendingLowerMold).center
             - SuctionContactPoint(), axis);
         float travel = Mathf.Clamp(projectedTravel, minimumTravel, maximumTravel);
         destination += axis * travel;
         if (Mathf.Abs(travel - projectedTravel) > 0.05f)
-            Debug.LogWarning("折弯机探头 r43 的投影超出 r775 行程，基座停在可达端点，机械臂继续伸向探头。", this);
-        Debug.Log(string.Format("机械臂对准 r43：沿 r775 移动 {0:F3}m，探头投影行程 {1:F3}m",
+            Debug.LogWarning("折弯机下模 r1547 的投影超出 r775 行程，基座停在可达端点。", this);
+        Debug.Log(string.Format("机械臂对准 r1547：沿 r775 移动 {0:F3}m，下模投影行程 {1:F3}m",
             travel, projectedTravel), this);
         return true;
     }
@@ -864,30 +1970,6 @@ public sealed class LoadingProcessController : MonoBehaviour
         }
     }
 
-    private IEnumerator RotateArmOutsideProbe(Vector3 pivot, Vector3 axis,
-        float degrees, Vector3 outsideDirection, float outsideLimit)
-    {
-        float rotated = 0f;
-        while (Mathf.Abs(degrees - rotated) > 0.01f)
-        {
-            float next = Mathf.MoveTowards(rotated, degrees,
-                armRotationSpeed * Time.deltaTime);
-            float step = next - rotated;
-            Quaternion rigRotation = armRig.rotation;
-            Vector3 rigPosition = armRig.position;
-            armRig.RotateAround(pivot, axis, step);
-            if (Vector3.Dot(GetBounds(sheet).center, outsideDirection) < outsideLimit)
-            {
-                armRig.position = rigPosition;
-                armRig.rotation = rigRotation;
-                Debug.LogWarning("机械臂已在折弯机外侧停止弯曲，避免成品穿过探头或机身。", this);
-                yield break;
-            }
-            rotated = next;
-            yield return null;
-        }
-    }
-
     private IEnumerator RestoreArmPosture(Vector3[] positions, Quaternion[] rotations,
         float rigScale)
     {
@@ -922,14 +2004,6 @@ public sealed class LoadingProcessController : MonoBehaviour
     private Vector3 SuctionContactPoint()
     {
         return armContactAnchor.position;
-    }
-
-    private Vector3 FindSuctionCupContactPoint()
-    {
-        Bounds cups = GetBounds(FindModelNode(armSuctionAssembly, 860));
-        foreach (int id in new[] { 866, 867, 868 })
-            cups.Encapsulate(GetBounds(FindModelNode(armSuctionAssembly, id)));
-        return new Vector3(cups.center.x, cups.min.y, cups.center.z);
     }
 
     private Vector3 SheetTopCenter()
@@ -995,6 +2069,17 @@ public sealed class LoadingProcessController : MonoBehaviour
             - new Vector3(resized.center.x, resized.min.y, resized.center.z);
         rawSheetInstance.gameObject.SetActive(false);
         sheet = finished.transform;
+        Bounds localFinished;
+        if (TryGetLocalMeshBounds(sheet, out localFinished))
+        {
+            Vector3 e = localFinished.extents;
+            finishedTopLocalNormal = e.x < e.y
+                ? (e.x < e.z ? Vector3.right : Vector3.forward)
+                : (e.y < e.z ? Vector3.up : Vector3.forward);
+            if (Vector3.Dot(sheet.TransformDirection(finishedTopLocalNormal),
+                Vector3.up) < 0f)
+                finishedTopLocalNormal = -finishedTopLocalNormal;
+        }
         ApplyWorkpieceColor(sheet);
         SetState(LoadingState.ReplaceWithFinishedPart, "原料已替换为冲压完毕成品");
         return true;
@@ -1875,8 +2960,34 @@ public sealed class LoadingProcessController : MonoBehaviour
             if (visuals[i] != null) visuals[i].position = positions[i];
     }
 
+#if UNITY_EDITOR
+    private void EnsureBendingPieceReferencesForPlay()
+    {
+        if (bendingPiecePrefabs != null && bendingPiecePrefabs.Length == 5
+            && System.Array.TrueForAll(bendingPiecePrefabs, prefab => prefab != null))
+            return;
+        GameObject[] pieces = new GameObject[5];
+        for (int i = 0; i < pieces.Length; i++)
+        {
+            pieces[i] = bendingPiecePrefabs != null && i < bendingPiecePrefabs.Length
+                ? bendingPiecePrefabs[i] : null;
+            if (pieces[i] == null)
+                pieces[i] = UnityEditor.AssetDatabase.LoadAssetAtPath<GameObject>(
+                    "Assets/Moudles/加工零件 冲压完毕" + (i + 1) + ".fbx");
+        }
+        bendingPiecePrefabs = pieces;
+    }
+#endif
+
     private bool ValidateSetup()
     {
+        if (bendingPiecePrefabs == null || bendingPiecePrefabs.Length != 5
+            || System.Array.Exists(bendingPiecePrefabs, prefab => prefab == null))
+        {
+            message = "缺少冲压成品的五个折弯分件引用";
+            Debug.LogError("LoadingProcessController: 缺少加工零件 冲压完毕1–5.fbx 引用。", this);
+            return false;
+        }
         bool valid = rawSheetPrefab != null && finishedPartPrefab != null
             && workpieceRoot != null && materialTable != null
             && armLongSlot != null && armBaseAssembly != null && bendingProbe != null
@@ -1884,6 +2995,10 @@ public sealed class LoadingProcessController : MonoBehaviour
             && armSegments != null && System.Array.TrueForAll(armSegments, part => part != null)
             && armSliders != null && System.Array.TrueForAll(armSliders, slider => slider != null)
             && bendingBody != null && bendingRail != null
+            && bendingUpper != null && bendingUpperMold != null
+            && bendingLowerMold != null
+            && FindModelNode(armSuctionAssembly, 863) != null
+            && FindModelNode(armSuctionAssembly, 857) != null
             && FindModelNode(armSuctionAssembly, 860) != null
             && FindModelNode(armSuctionAssembly, 866) != null
             && FindModelNode(armSuctionAssembly, 867) != null

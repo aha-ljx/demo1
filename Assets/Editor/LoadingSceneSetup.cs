@@ -63,7 +63,11 @@ internal static class LoadingSceneSetup
             && controller.transferToPunchPoint != null;
         // A configured scene may contain hand-adjusted clamp transforms. Only the
         // explicit menu command is allowed to run the model seating routine again.
-        if (alreadyConfigured && !force) return;
+        if (alreadyConfigured && !force)
+        {
+            EnsureBendingPieceReferences(scene, controller);
+            return;
+        }
         Transform modelRoot = FindModelRoot(scene);
         if (modelRoot == null)
         {
@@ -303,6 +307,10 @@ internal static class LoadingSceneSetup
             "Assets/Moudles/加工零件.fbx");
         controller.finishedPartPrefab = AssetDatabase.LoadAssetAtPath<GameObject>(
             "Assets/Moudles/加工零件 冲压完毕.fbx");
+        controller.bendingPiecePrefabs = new GameObject[5];
+        for (int i = 0; i < controller.bendingPiecePrefabs.Length; i++)
+            controller.bendingPiecePrefabs[i] = AssetDatabase.LoadAssetAtPath<GameObject>(
+                "Assets/Moudles/加工零件 冲压完毕" + (i + 1) + ".fbx");
         controller.materialTable = table.GetComponent<Renderer>();
         controller.controlConsole = console.GetComponent<Renderer>();
         controller.suctionVisuals = new[] { suctionAssembly, suctionBox };
@@ -334,8 +342,49 @@ internal static class LoadingSceneSetup
 
     private static void OnSceneOpened(Scene scene, OpenSceneMode mode) => ConfigureActiveScene();
 
+    private static void EnsureBendingPieceReferences(Scene scene,
+        LoadingProcessController controller)
+    {
+        GameObject[] current = controller.bendingPiecePrefabs;
+        if (current != null && current.Length == 5
+            && System.Array.TrueForAll(current, prefab => prefab != null)) return;
+
+        bool wasDirty = scene.isDirty;
+        GameObject[] pieces = new GameObject[5];
+        for (int i = 0; i < pieces.Length; i++)
+        {
+            pieces[i] = current != null && i < current.Length ? current[i] : null;
+            if (pieces[i] == null)
+                pieces[i] = AssetDatabase.LoadAssetAtPath<GameObject>(
+                    "Assets/Moudles/加工零件 冲压完毕" + (i + 1) + ".fbx");
+            if (pieces[i] == null)
+            {
+                Debug.LogError("LoadingSceneSetup: 缺少折弯分件资源 "
+                    + (i + 1), controller);
+                return;
+            }
+        }
+        controller.bendingPiecePrefabs = pieces;
+        EditorUtility.SetDirty(controller);
+        EditorSceneManager.MarkSceneDirty(scene);
+        if (!wasDirty && !EditorApplication.isPlayingOrWillChangePlaymode)
+            EditorSceneManager.SaveScene(scene);
+        Debug.Log("LoadingSceneSetup: 已补齐五个折弯分件引用，保留夹爪和点位。", controller);
+    }
+
     private static void OnPlayModeChanged(PlayModeStateChange state)
     {
+        if (state == PlayModeStateChange.ExitingEditMode)
+        {
+            Scene scene = EditorSceneManager.GetActiveScene();
+            if (scene.path == ScenePath)
+            {
+                LoadingProcessController controller =
+                    Object.FindObjectOfType<LoadingProcessController>();
+                if (controller != null)
+                    EnsureBendingPieceReferences(scene, controller);
+            }
+        }
         if (state == PlayModeStateChange.EnteredEditMode)
             EditorApplication.delayCall += ConfigureActiveScene;
     }
