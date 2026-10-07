@@ -13,11 +13,20 @@ public sealed class LoadingProcessController : MonoBehaviour
         PickupFeed, PickupRailEndReached, PlaceSheetOnPunchTable,
         SlideSheetToPunchClamp, PunchClampMoveToAcquire,
         PunchClampAcquire, PickupClampRelease, TransferToPunchClamp,
-        PickupClampReturn, PunchFeed, PunchStartPosition, ReadyForPunching
+        PickupClampReturn, PunchFeed, PunchStartPosition,
+        PunchClampRelease, SlideSheetIntoPunchGuard, PunchClampReturn,
+        Punching, ReplaceWithFinishedPart, RetrieveFinishedPart,
+        PunchClampPullBack, PunchClampMoveToRailEnd, FinishedPartDelivered,
+        SlideFinishedPartToTableEdge, ArmBaseTravel, ArmRotateToPart,
+        ArmSuctionPickup, ArmLiftPart, ArmRestorePosture,
+        ArmBaseToBendingProbe, ArmBendToProbe,
+        PlacePartOnBendingProbe, ArmClearBendingProbe,
+        ReadyForPunching
     }
 
     [Header("工件与设备")]
     public GameObject rawSheetPrefab;
+    public GameObject finishedPartPrefab;
     public Transform workpieceRoot;
     public Renderer materialTable;
     public Renderer controlConsole;
@@ -79,9 +88,15 @@ public sealed class LoadingProcessController : MonoBehaviour
     [Min(0f)] public float jawCloseDistance = 0.035f;
     [Min(0.0001f)] public float positionTolerance = 0.002f;
     [Min(0.1f)] public float rawSheetWorldWidth = 0.8f;
+    [ColorUsage(false)] public Color rawSheetColor = new Color(59f / 255f, 66f / 255f, 74f / 255f, 1f);
     [Min(0f)] public float punchTableGrooveInset = 0.01f;
     [Min(0.001f)] public float punchRailOutsideClearance = 0.01f;
     [Min(0.1f)] public float consoleInteractionDistance = 2.5f;
+    [Min(0.01f)] public float armBaseMoveSpeed = 0.7f;
+    [Min(1f)] public float armRotationSpeed = 45f;
+    [Min(0.01f)] public float armPickupSpeed = 0.35f;
+    [Min(0.01f)] public float armLiftHeight = 0.15f;
+    [Min(0f)] public float armPickupRailInset = 0.15f;
 
     public LoadingState CurrentState { get; private set; } = LoadingState.Idle;
     public bool SuctionActive { get; private set; }
@@ -92,6 +107,11 @@ public sealed class LoadingProcessController : MonoBehaviour
 
     private Coroutine sequence;
     private Transform sheet;
+    private Transform rawSheetInstance;
+    private Quaternion workpieceHomeLocalRotation, rawSheetHomeLocalRotation;
+    private Vector3 workpieceHomeLocalScale, rawSheetHomeLocalPosition;
+    private Vector3 rawSheetHomeLocalScale;
+    private Material rawSheetMaterial;
     private Transform workpieceHomeParent;
     private Vector3[] suctionVisualHome;
     private Vector3[] clampVisualHome;
@@ -107,6 +127,19 @@ public sealed class LoadingProcessController : MonoBehaviour
     private Vector3 suctionGearLocalAxis;
     private Quaternion suctionGearHomeRotation;
     private Vector3 punchMoverHome;
+    private Transform punchRightGuard;
+    private Transform punchRailShell;
+    private Transform armLongSlot, armBaseAssembly, armBaseJoint;
+    private Transform armSuctionAssembly, bendingProbe;
+    private Transform bendingBody, bendingRail;
+    private Transform[] armSegments, armMovingVisuals, armSliders;
+    private Transform[] armOriginalParents;
+    private Transform armRig;
+    private Transform armContactAnchor;
+    private Vector3[] armVisualHomePositions;
+    private Quaternion[] armVisualHomeRotations;
+    private Transform armBaseMover;
+    private Vector3 armBaseHome;
     private bool initialized;
     private string message = "准备上料";
     private Font uiFont;
@@ -124,6 +157,11 @@ public sealed class LoadingProcessController : MonoBehaviour
         if (pickupClampBeam == null) pickupClampBeam = FindModelNode(1017);
         if (punchTable == null) punchTable = FindModelNode(1414)?.GetComponent<Renderer>();
         if (punchRailFrame == null) punchRailFrame = FindModelNode(889);
+        punchRightGuard = FindModelNode(1472);
+        punchRailShell = FindModelNode(1490);
+        BindTransferArm();
+        bendingBody = FindModelNode(268);
+        bendingRail = FindModelNode(411);
         if (punchClampBrackets == null || punchClampBrackets.Length != 2)
             punchClampBrackets = new[] { FindModelNode(1513), FindModelNode(1499) };
         if (punchClampVisuals != null && punchClampVisuals.Length == 2
@@ -139,7 +177,7 @@ public sealed class LoadingProcessController : MonoBehaviour
             punchRailStartPoint = CreateRuntimeRailStart(punchClampRail,
                 punchClampHomePoint, punchRailEndPoint, "PunchRailStartPoint (runtime)");
         if (!ValidateSetup()) return;
-        AlignPunchClampAssemblies();
+        SyncPunchClampPointsToPlacedAssemblies();
         // 控制空节点不属于 FBX。旧场景中它可能留在世界原点，模型本身仍在导轨上。
         suctionMover.position = suctionHome.position;
         clampMover.position = pickupClampHomePoint.position;
@@ -157,6 +195,28 @@ public sealed class LoadingProcessController : MonoBehaviour
         suctionVisualHome = SavePositions(suctionVisuals);
         clampVisualHome = SavePositions(clampVisuals);
         punchVisualHome = SavePositions(punchClampVisuals);
+        armRig = new GameObject("TransferArmRig (runtime)").transform;
+        armRig.position = GetBounds(armBaseJoint).center;
+        armOriginalParents = new Transform[armSegments.Length + 1];
+        for (int i = 0; i < armSegments.Length; i++)
+        {
+            armOriginalParents[i] = armSegments[i].parent;
+            armSegments[i].SetParent(armRig, true);
+        }
+        armOriginalParents[armSegments.Length] = armSuctionAssembly.parent;
+        armSuctionAssembly.SetParent(armRig, true);
+        Vector3 cupContact = FindSuctionCupContactPoint();
+        armContactAnchor = new GameObject("SuctionContact (runtime)").transform;
+        armContactAnchor.SetParent(armSuctionAssembly, false);
+        armContactAnchor.position = cupContact;
+        armMovingVisuals = new[] { armBaseAssembly, armRig };
+        armBaseMover = new GameObject("ArmBaseMover (runtime)").transform;
+        armBaseHome = GetBounds(armBaseAssembly).center;
+        armBaseMover.position = armBaseHome;
+        armVisualHomePositions = SavePositions(armMovingVisuals);
+        armVisualHomeRotations = new Quaternion[armMovingVisuals.Length];
+        for (int i = 0; i < armMovingVisuals.Length; i++)
+            armVisualHomeRotations[i] = armMovingVisuals[i].rotation;
         punchJawAHome = SaveLocalPositions(punchJawsA);
         punchJawBHome = SaveLocalPositions(punchJawsB);
         if (clampJawA != null) jawAHome = clampJawA.localPosition;
@@ -178,8 +238,65 @@ public sealed class LoadingProcessController : MonoBehaviour
             raw.transform.localScale *= rawSheetWorldWidth / width;
         }
         sheet = workpieceRoot.GetChild(0);
+        rawSheetInstance = sheet;
+        workpieceHomeLocalRotation = workpieceRoot.localRotation;
+        workpieceHomeLocalScale = workpieceRoot.localScale;
+        rawSheetHomeLocalPosition = rawSheetInstance.localPosition;
+        rawSheetHomeLocalRotation = rawSheetInstance.localRotation;
+        rawSheetHomeLocalScale = rawSheetInstance.localScale;
+        ApplyWorkpieceColor(sheet);
         initialized = true;
         ResetLoadingProcess();
+    }
+
+    private void ApplyWorkpieceColor(Transform target)
+    {
+        if (rawSheetMaterial == null)
+        {
+            Shader shader = Shader.Find("Standard");
+            if (shader == null)
+            {
+                Debug.LogError("LoadingProcessController: Standard shader not found for workpiece.", this);
+                return;
+            }
+
+            rawSheetMaterial = new Material(shader)
+            {
+                name = "Workpiece Dark Gray (runtime)",
+                color = rawSheetColor
+            };
+            rawSheetMaterial.SetFloat("_Metallic", 0.15f);
+            rawSheetMaterial.SetFloat("_Glossiness", 0.35f);
+        }
+
+        foreach (Renderer renderer in target.GetComponentsInChildren<Renderer>(true))
+        {
+            Material[] materials = renderer.sharedMaterials;
+            if (materials.Length == 0)
+            {
+                renderer.sharedMaterial = rawSheetMaterial;
+                continue;
+            }
+
+            for (int i = 0; i < materials.Length; i++) materials[i] = rawSheetMaterial;
+            renderer.sharedMaterials = materials;
+        }
+    }
+
+    private void OnDestroy()
+    {
+        if (rawSheetMaterial != null) Destroy(rawSheetMaterial);
+        if (armBaseMover != null) Destroy(armBaseMover.gameObject);
+        if (armRig != null)
+        {
+            if (armContactAnchor != null) Destroy(armContactAnchor.gameObject);
+            for (int i = 0; i < armSegments.Length; i++)
+                if (armSegments[i] != null)
+                    armSegments[i].SetParent(armOriginalParents[i], true);
+            if (armSuctionAssembly != null)
+                armSuctionAssembly.SetParent(armOriginalParents[armSegments.Length], true);
+            Destroy(armRig.gameObject);
+        }
     }
 
     private void Update()
@@ -206,7 +323,19 @@ public sealed class LoadingProcessController : MonoBehaviour
         if (!initialized) return;
         if (sequence != null) StopCoroutine(sequence);
         sequence = null;
+        if (sheet != rawSheetInstance)
+        {
+            sheet.SetParent(null, true);
+            Destroy(sheet.gameObject);
+            sheet = rawSheetInstance;
+            rawSheetInstance.gameObject.SetActive(true);
+        }
         workpieceRoot.SetParent(workpieceHomeParent, true);
+        workpieceRoot.localRotation = workpieceHomeLocalRotation;
+        workpieceRoot.localScale = workpieceHomeLocalScale;
+        rawSheetInstance.localPosition = rawSheetHomeLocalPosition;
+        rawSheetInstance.localRotation = rawSheetHomeLocalRotation;
+        rawSheetInstance.localScale = rawSheetHomeLocalScale;
         suctionMover.position = suctionMoverHome;
         clampMover.position = clampMoverHome;
         punchClampMover.position = punchMoverHome;
@@ -215,6 +344,11 @@ public sealed class LoadingProcessController : MonoBehaviour
         suctionGear.localRotation = suctionGearHomeRotation;
         RestorePositions(clampVisuals, clampVisualHome);
         RestorePositions(punchClampVisuals, punchVisualHome);
+        armBaseMover.position = armBaseHome;
+        RestorePositions(armMovingVisuals, armVisualHomePositions);
+        for (int i = 0; i < armMovingVisuals.Length; i++)
+            armMovingVisuals[i].rotation = armVisualHomeRotations[i];
+        armRig.localScale = Vector3.one;
         RestoreLocalPositions(punchJawsA, punchJawAHome);
         RestoreLocalPositions(punchJawsB, punchJawBHome);
         if (clampJawA != null) clampJawA.localPosition = jawAHome;
@@ -341,24 +475,560 @@ public sealed class LoadingProcessController : MonoBehaviour
         SetState(LoadingState.TransferToPunchClamp, "板材控制权切换到冲床夹爪");
         ReparentWithoutJump(workpieceRoot, punchClampMover);
 
-        SetState(LoadingState.PunchFeed, "冲床夹爪沿内部导轨继续送料");
-        AlignAutoPunchStartToRail();
-        Vector3 punchDestination = punchClampMover.position
-            + punchStartPoint.position - SheetBottomCenter();
-        if (!RailTargetValid(punchClampMover.position, punchDestination,
-            punchRailStartPoint, punchRailEndPoint, "冲床夹爪")) yield break;
-        yield return MoveCarrier(punchClampMover, punchClampVisuals,
-            punchDestination, punchFeedSpeed);
-
-        SetState(LoadingState.PunchStartPosition, "板材到达冲压初始位置");
-        if (!PunchClampActive || PickupClampActive || workpieceRoot.parent != punchClampMover
-            || Vector3.Distance(SheetBottomCenter(), punchStartPoint.position) > positionTolerance * 2f)
+        SetState(LoadingState.PunchFeed, "两套冲床夹爪沿模型 Y 轴将板材送入右侧保护罩");
+        if (punchRightGuard == null)
         {
-            Fail("冲压初始位置或工件控制权异常");
+            Fail("未找到转塔冲床右侧保护罩 r1472");
             yield break;
         }
-        SetState(LoadingState.ReadyForPunching, "上料完成；冲床夹爪保持夹紧");
+        Bounds guardBounds = GetBounds(punchRightGuard);
+        // CAD/model Y is the horizontal Unity Z direction for this imported FBX.
+        // Keep world Y (height) unchanged while both assemblies carry the sheet.
+        float feedDistanceZ = guardBounds.center.z - SheetBottomCenter().z;
+        if (Mathf.Abs(feedDistanceZ) < rawSheetWorldWidth * 0.5f)
+        {
+            Fail(string.Format("模型 Y 轴送料距离仅 {0:F3}m；请检查 r1472 与板材位置",
+                Mathf.Abs(feedDistanceZ)));
+            yield break;
+        }
+        Vector3 punchDestination = punchClampMover.position
+            + Vector3.forward * SafePunchClampTravel(feedDistanceZ, guardBounds);
+        float clampTravelZ = punchDestination.z - punchClampMover.position.z;
+        punchRailStartPoint.position = punchClampMover.position;
+        punchRailEndPoint.position = punchDestination;
+        if (Mathf.Abs(clampTravelZ) > positionTolerance
+            && !RailTargetValid(punchClampMover.position, punchDestination,
+            punchRailStartPoint, punchRailEndPoint, "冲床夹爪")) yield break;
+        Vector3 deliveryPoint = SheetBottomCenter() + Vector3.forward * feedDistanceZ;
+        punchStartPoint.position = deliveryPoint;
+        Debug.Log(string.Format("冲床送料：模型 Y/Unity Z，夹爪 Z {0:F3} -> {1:F3}，板材目标 Z {2:F3}，r1472 Z 范围 {3:F3}..{4:F3}，夹爪安全行程 {5:F3}m",
+            punchClampMover.position.z, punchDestination.z,
+            deliveryPoint.z, guardBounds.min.z, guardBounds.max.z,
+            Mathf.Abs(clampTravelZ)), this);
+        if (Mathf.Abs(clampTravelZ) > positionTolerance)
+            yield return MoveCarrier(punchClampMover, punchClampVisuals,
+                punchDestination, punchFeedSpeed);
+
+        SetState(LoadingState.PunchClampRelease, "冲床夹爪在保护罩前松开板材");
+        yield return MoveJawPairs(punchJawsA, punchJawsB, false);
+        PunchClampActive = false;
+        ReparentWithoutJump(workpieceRoot, workpieceHomeParent);
+
+        float remainingZ = deliveryPoint.z - SheetBottomCenter().z;
+        if (Mathf.Abs(remainingZ) > positionTolerance)
+        {
+            SetState(LoadingState.SlideSheetIntoPunchGuard,
+                "板材沿桌面继续移动到保护罩中间，电线支板保持在罩外");
+            yield return MoveWorkpiece(workpieceRoot.position
+                + Vector3.forward * remainingZ, punchFeedSpeed);
+        }
+        SetState(LoadingState.PunchStartPosition, "板材到达转塔冲床右侧保护罩内");
+        if (PickupClampActive || workpieceRoot.parent != workpieceHomeParent
+            || Vector3.Distance(SheetBottomCenter(), punchStartPoint.position) > positionTolerance * 2f)
+        {
+            Fail("板材未到达 r1472 中间或工件控制权异常");
+            yield break;
+        }
+
+        SetState(LoadingState.Punching, "板材在保护罩内冲压，等待 2 秒");
+        yield return new WaitForSeconds(2f);
+        if (!ReplaceSheetWithFinishedPart()) yield break;
+
+        SetState(LoadingState.RetrieveFinishedPart, "成品沿模型 Y 轴移出保护罩，交给冲床夹爪");
+        Vector3 retrievalPoint = SheetBottomCenter();
+        retrievalPoint.z -= remainingZ;
+        yield return MoveWorkpiece(workpieceRoot.position
+            + Vector3.forward * (retrievalPoint.z - SheetBottomCenter().z), punchFeedSpeed);
+        yield return MoveJawPairs(punchJawsA, punchJawsB, true);
+        PunchClampActive = true;
+        ReparentWithoutJump(workpieceRoot, punchClampMover);
+
+        SetState(LoadingState.PunchClampPullBack, "两套冲床夹爪沿模型 Y 轴拉回成品");
+        if (Mathf.Abs(clampTravelZ) > positionTolerance
+            && !RailTargetValid(punchClampMover.position, punchMoverHome,
+            punchRailStartPoint, punchRailEndPoint, "冲床夹爪拉回")) yield break;
+        if (Mathf.Abs(clampTravelZ) > positionTolerance)
+            yield return MoveCarrier(punchClampMover, punchClampVisuals,
+                punchMoverHome, punchClampMoveSpeed);
+
+        Vector3 xRailEnd;
+        if (!TryGetPunchXRailEnd(out xRailEnd)) yield break;
+        SetState(LoadingState.PunchClampMoveToRailEnd, "两套冲床夹爪沿模型 X 轴导轨送出成品");
+        yield return MoveCarrier(punchClampMover, punchClampVisuals,
+            xRailEnd, punchClampMoveSpeed);
+        SetState(LoadingState.FinishedPartDelivered, "成品已到达模型 X 轴导轨尽头");
+        yield return MoveJawPairs(punchJawsA, punchJawsB, false);
+        PunchClampActive = false;
+        ReparentWithoutJump(workpieceRoot, workpieceHomeParent);
+        SetState(LoadingState.PunchClampReturn, "成品留在 r1490 尽头，两套冲床夹爪沿 X 轴返回原位");
+        yield return MoveCarrier(punchClampMover, punchClampVisuals,
+            punchMoverHome, punchClampMoveSpeed);
+
+        Vector3 tableEdgeBottom;
+        if (!TryGetFinishedPartTableEdge(out tableEdgeBottom)) yield break;
+        SetState(LoadingState.SlideFinishedPartToTableEdge,
+            "冲压成品平移到桌子左 r1414 边缘");
+        yield return MoveWorkpiece(workpieceRoot.position
+            + Vector3.up * (tableEdgeBottom.y - SheetBottomCenter().y), feedSpeed);
+        yield return MoveWorkpiece(workpieceRoot.position
+            + tableEdgeBottom - SheetBottomCenter(), feedSpeed);
+
+        Vector3 armDestination;
+        if (!TryGetArmRailEnd(out armDestination)) yield break;
+        SetState(LoadingState.ArmBaseTravel, "滑槽基座 r872 沿 r775 移至桌面侧端点前安全位置");
+        yield return MoveCarrier(armBaseMover, armMovingVisuals,
+            armDestination, armBaseMoveSpeed);
+        Vector3[] pickupPosturePositions = SavePositions(armMovingVisuals);
+        Quaternion[] pickupPostureRotations = SaveRotations(armMovingVisuals);
+        float pickupPostureScale = armRig.localScale.x;
+
+        Vector3 pivot = GetBounds(armBaseJoint).center;
+        Vector3 from = SuctionContactPoint() - pivot;
+        Vector3 to = SheetTopCenter() - pivot;
+        from.y = to.y = 0f;
+        if (from.sqrMagnitude < 0.0001f || to.sqrMagnitude < 0.0001f)
+        {
+            Fail("机械臂吸盘或成品与旋转轴重合，无法计算旋转角度");
+            yield break;
+        }
+        SetState(LoadingState.ArmRotateToPart, "机械臂绕基座关节旋转，吸盘朝向成品");
+        yield return RotateArmAroundBase(pivot,
+            Vector3.SignedAngle(from, to, Vector3.up));
+
+        SetState(LoadingState.ArmSuctionPickup, "机械臂吸盘接触并吸附冲压成品");
+        Vector3 productTop = SheetTopCenter();
+        float approachHeight = productTop.y
+            + Mathf.Max(armLiftHeight, 0.25f) + 0.02f;
+        Vector3 contact = SuctionContactPoint();
+        yield return MoveArmSuctionTo(new Vector3(contact.x, approachHeight, contact.z));
+        yield return MoveArmSuctionTo(new Vector3(productTop.x, approachHeight, productTop.z));
+        yield return MoveArmSuctionTo(productTop + Vector3.up * 0.005f);
+        ReparentWithoutJump(workpieceRoot, armSuctionAssembly);
+        SetState(LoadingState.ArmLiftPart, "机械臂吸盘抬起冲压成品");
+        yield return MoveArmSuctionTo(SuctionContactPoint()
+            + Vector3.up * armLiftHeight);
+
+        SetState(LoadingState.ArmRestorePosture, "机械臂携成品恢复取件前姿态");
+        yield return RestoreArmPosture(pickupPosturePositions, pickupPostureRotations,
+            pickupPostureScale);
+
+        Vector3 probeRailDestination;
+        if (!TryGetArmRailPositionForProbe(out probeRailDestination)) yield break;
+        SetState(LoadingState.ArmBaseToBendingProbe,
+            "滑槽基座 r872 沿 r775 移到折弯机探头 r43 方位");
+        yield return MoveCarrier(armBaseMover, armMovingVisuals,
+            probeRailDestination, armBaseMoveSpeed);
+
+        Vector3[] transferPosturePositions = SavePositions(armMovingVisuals);
+        Quaternion[] transferPostureRotations = SaveRotations(armMovingVisuals);
+        float transferPostureScale = armRig.localScale.x;
+        Bounds probeBounds = GetBounds(bendingProbe);
+        Vector3 railNear, railFar;
+        if (!TryRailMeshEnds(bendingRail, out railNear, out railFar))
+        {
+            Fail("无法读取折弯机导轨 r411 的外伸方向");
+            yield break;
+        }
+        Vector3 outsideDirection = railFar - railNear;
+        outsideDirection.y = 0f;
+        if (outsideDirection.magnitude < 0.01f)
+        {
+            Fail("折弯机导轨 r411 没有有效的水平外伸方向");
+            yield break;
+        }
+        outsideDirection.Normalize();
+        if (Vector3.Dot(SheetBottomCenter() - probeBounds.center,
+            outsideDirection) < 0f)
+            outsideDirection = -outsideDirection;
+        Bounds bodyBounds = GetBounds(bendingBody);
+        float frontOfMachine = Mathf.Max(
+            Vector3.Dot(probeBounds.center, outsideDirection)
+                + HorizontalRadius(probeBounds, outsideDirection),
+            Vector3.Dot(bodyBounds.center, outsideDirection)
+                + HorizontalRadius(bodyBounds, outsideDirection));
+        float outsideLimit = frontOfMachine
+            + HorizontalRadius(GetBounds(sheet), outsideDirection) + 0.03f;
+        float outsideGap = outsideLimit + 0.15f
+            - Vector3.Dot(GetBounds(sheet).center, outsideDirection);
+        if (outsideGap > 0f)
+            yield return MoveArmSuctionTo(SuctionContactPoint()
+                + outsideDirection * outsideGap);
+        Vector3[] safePosturePositions = SavePositions(armMovingVisuals);
+        Quaternion[] safePostureRotations = SaveRotations(armMovingVisuals);
+        float safePostureScale = armRig.localScale.x;
+
+        pivot = GetBounds(armBaseJoint).center;
+        from = SuctionContactPoint() - pivot;
+        to = probeBounds.center - pivot;
+        from.y = to.y = 0f;
+        if (from.sqrMagnitude < 0.0001f || to.sqrMagnitude < 0.0001f)
+        {
+            Fail("机械臂无法计算折弯机探头方位");
+            yield break;
+        }
+        SetState(LoadingState.ArmBendToProbe, "机械臂在折弯机外侧朝探头弯曲");
+        yield return RotateArmOutsideProbe(pivot, Vector3.up,
+            Vector3.SignedAngle(from, to, Vector3.up),
+            outsideDirection, outsideLimit);
+
+        Vector3 horizontal = to.normalized;
+        Vector3 bendAxis = Vector3.Cross(Vector3.up, horizontal).normalized;
+        Vector3 targetCup = SuctionContactPoint()
+            + probeBounds.center - SheetBottomCenter();
+        float bendAngle = Vector3.SignedAngle(SuctionContactPoint() - pivot,
+            targetCup - pivot, bendAxis);
+        yield return RotateArmOutsideProbe(pivot, bendAxis,
+            Mathf.Clamp(bendAngle, -25f, 25f),
+            outsideDirection, outsideLimit);
+
+        probeBounds = GetBounds(bendingProbe);
+        Vector3 probeTip = probeBounds.center + outsideDirection
+            * HorizontalRadius(probeBounds, outsideDirection);
+        Vector3 probeBottom = new Vector3(probeTip.x,
+            probeBounds.max.y + 0.005f, probeTip.z);
+        if (Vector3.Dot(probeTip, outsideDirection) < outsideLimit - 0.02f)
+        {
+            SetState(LoadingState.ArmClearBendingProbe,
+                "固定探头位于机身内，机械臂携成品退回外侧，避免穿模");
+            yield return RestoreArmPosture(safePosturePositions,
+                safePostureRotations, safePostureScale);
+            SetState(LoadingState.ReadyForPunching,
+                "成品保持在机械臂吸盘上；固定探头无法在机身外安全接料");
+            sequence = null;
+            yield break;
+        }
+        SetState(LoadingState.PlacePartOnBendingProbe,
+            "吸盘在机器外侧将成品放到固定探头 r43 上");
+        float safePartHeight = Mathf.Max(SheetBottomCenter().y,
+            probeBottom.y + armLiftHeight);
+        yield return MoveArmSuctionTo(SuctionContactPoint()
+            + Vector3.up * (safePartHeight - SheetBottomCenter().y));
+        Vector3 slide = probeBottom - SheetBottomCenter();
+        slide.y = 0f;
+        yield return MoveArmSuctionTo(SuctionContactPoint() + slide);
+        yield return MoveArmSuctionTo(SuctionContactPoint()
+            + Vector3.up * (probeBottom.y - SheetBottomCenter().y));
+        if (Vector3.Distance(SheetBottomCenter(), probeBottom) > positionTolerance * 3f)
+        {
+            Fail("冲压成品未到达折弯机探头 r43 顶部");
+            yield break;
+        }
+        ReparentWithoutJump(workpieceRoot, workpieceHomeParent);
+        SetState(LoadingState.ArmClearBendingProbe,
+            "吸盘释放成品，机械臂恢复交接前姿态");
+        yield return MoveArmSuctionTo(SuctionContactPoint()
+            + Vector3.up * armLiftHeight);
+        float suctionClearance = outsideLimit + 0.1f
+            - Vector3.Dot(SuctionContactPoint(), outsideDirection);
+        if (suctionClearance > 0f)
+            yield return MoveArmSuctionTo(SuctionContactPoint()
+                + outsideDirection * suctionClearance);
+        yield return RestoreArmPosture(transferPosturePositions, transferPostureRotations,
+            transferPostureScale);
+        SetState(LoadingState.ReadyForPunching, "成品已交给固定探头；按 R 可重置");
         sequence = null;
+    }
+
+    private void BindTransferArm()
+    {
+        armLongSlot = FindModelNode(775);
+        Transform bendingBeam = FindModelNode(37);
+        bendingProbe = bendingBeam != null ? FindModelNode(bendingBeam, 43) : null;
+        armBaseAssembly = FindModelNode(869);
+        armSuctionAssembly = FindModelNode(854);
+        armBaseJoint = armBaseAssembly != null ? FindModelNode(armBaseAssembly, 878) : null;
+        armSegments = new[] { FindModelNode(839), FindModelNode(842),
+            FindModelNode(845), FindModelNode(848), FindModelNode(851) };
+        armMovingVisuals = new[] { armBaseAssembly, armSegments[0], armSegments[1],
+            armSegments[2], armSegments[3], armSegments[4], armSuctionAssembly };
+        armSliders = armBaseAssembly != null
+            ? new[] { FindModelNode(armBaseAssembly, 875),
+                FindModelNode(armBaseAssembly, 879),
+                FindModelNode(armBaseAssembly, 880),
+                FindModelNode(armBaseAssembly, 881) }
+            : null;
+    }
+
+    private bool TryGetArmRailEnd(out Vector3 destination)
+    {
+        destination = armBaseMover.position;
+        Vector3 axis;
+        float minimumTravel, maximumTravel;
+        if (!TryGetArmRailLimits(out axis, out minimumTravel, out maximumTravel))
+            return false;
+        Vector3 lowerEnd = destination + axis * minimumTravel;
+        Vector3 upperEnd = destination + axis * maximumTravel;
+        Vector3 product = SheetTopCenter();
+        product.y = lowerEnd.y = upperEnd.y = 0f;
+        bool upperNearTable = (upperEnd - product).sqrMagnitude
+            < (lowerEnd - product).sqrMagnitude;
+        float inset = Mathf.Min(armPickupRailInset,
+            (maximumTravel - minimumTravel) * 0.25f);
+        float travel = upperNearTable
+            ? maximumTravel - inset : minimumTravel + inset;
+        if (Mathf.Abs(travel) <= positionTolerance)
+        {
+            Debug.Log("滑槽基座已位于靠近成品的 r775 导轨尽头。", this);
+            return true;
+        }
+        destination = armBaseMover.position + axis * travel;
+        Debug.Log(string.Format("机械臂滑槽送料：r872 沿 r775 移动 {0:F3}m，距桌面侧端点内收 {1:F3}m，终点 {2}",
+            travel, inset, destination), this);
+        return true;
+    }
+
+    private bool TryGetArmRailPositionForProbe(out Vector3 destination)
+    {
+        destination = armBaseMover.position;
+        Vector3 axis;
+        float minimumTravel, maximumTravel;
+        if (!TryGetArmRailLimits(out axis, out minimumTravel, out maximumTravel))
+            return false;
+        float projectedTravel = Vector3.Dot(GetBounds(bendingProbe).center
+            - SuctionContactPoint(), axis);
+        float travel = Mathf.Clamp(projectedTravel, minimumTravel, maximumTravel);
+        destination += axis * travel;
+        if (Mathf.Abs(travel - projectedTravel) > 0.05f)
+            Debug.LogWarning("折弯机探头 r43 的投影超出 r775 行程，基座停在可达端点，机械臂继续伸向探头。", this);
+        Debug.Log(string.Format("机械臂对准 r43：沿 r775 移动 {0:F3}m，探头投影行程 {1:F3}m",
+            travel, projectedTravel), this);
+        return true;
+    }
+
+    private bool TryGetArmRailLimits(out Vector3 axis,
+        out float minimumTravel, out float maximumTravel)
+    {
+        axis = Vector3.zero;
+        minimumTravel = float.NegativeInfinity;
+        maximumTravel = float.PositiveInfinity;
+        Vector3 near, far;
+        if (!TryRailMeshEnds(armLongSlot, out near, out far))
+            return Fail("无法读取长滑槽 r775 的网格长轴");
+        axis = far - near;
+        axis.y = 0f;
+        if (axis.magnitude < 0.5f)
+            return Fail("长滑槽 r775 的水平导轨长度异常");
+        axis.Normalize();
+        Bounds rail = GetBounds(armLongSlot);
+        float railCenter = Vector3.Dot(rail.center, axis);
+        float railRadius = HorizontalRadius(rail, axis);
+        const float clearance = 0.03f;
+        foreach (Transform slider in armSliders)
+        {
+            Bounds bounds = GetBounds(slider);
+            float center = Vector3.Dot(bounds.center, axis);
+            float radius = HorizontalRadius(bounds, axis);
+            minimumTravel = Mathf.Max(minimumTravel,
+                railCenter - railRadius + clearance - (center - radius));
+            maximumTravel = Mathf.Min(maximumTravel,
+                railCenter + railRadius - clearance - (center + radius));
+        }
+        if (minimumTravel > maximumTravel)
+            return Fail("滑槽基座的四个滑块无法同时处于 r775 导轨范围内");
+        return true;
+    }
+
+    private bool TryGetFinishedPartTableEdge(out Vector3 bottomCenter)
+    {
+        bottomCenter = SheetBottomCenter();
+        Bounds table = punchTable.bounds;
+        Bounds part = GetBounds(sheet);
+        const float inset = 0.02f;
+        float minimumZ = table.min.z + part.extents.z + inset;
+        float maximumZ = table.max.z - part.extents.z - inset;
+        if (table.size.x < part.size.x + 2f * inset || minimumZ > maximumZ)
+            return Fail("成品尺寸超出桌子左 r1414 的可放置范围");
+        bottomCenter = new Vector3(table.max.x - part.extents.x - inset,
+            table.max.y + 0.002f,
+            Mathf.Clamp(part.center.z, minimumZ, maximumZ));
+        return true;
+    }
+
+    private IEnumerator RotateArmAroundBase(Vector3 pivot, float degrees)
+    {
+        yield return RotateArmAroundAxis(pivot, Vector3.up, degrees);
+    }
+
+    private IEnumerator RotateArmAroundAxis(Vector3 pivot, Vector3 axis,
+        float degrees)
+    {
+        float rotated = 0f;
+        while (Mathf.Abs(degrees - rotated) > 0.01f)
+        {
+            float next = Mathf.MoveTowards(rotated, degrees,
+                armRotationSpeed * Time.deltaTime);
+            float step = next - rotated;
+            armRig.RotateAround(pivot, axis, step);
+            rotated = next;
+            yield return null;
+        }
+    }
+
+    private IEnumerator RotateArmOutsideProbe(Vector3 pivot, Vector3 axis,
+        float degrees, Vector3 outsideDirection, float outsideLimit)
+    {
+        float rotated = 0f;
+        while (Mathf.Abs(degrees - rotated) > 0.01f)
+        {
+            float next = Mathf.MoveTowards(rotated, degrees,
+                armRotationSpeed * Time.deltaTime);
+            float step = next - rotated;
+            Quaternion rigRotation = armRig.rotation;
+            Vector3 rigPosition = armRig.position;
+            armRig.RotateAround(pivot, axis, step);
+            if (Vector3.Dot(GetBounds(sheet).center, outsideDirection) < outsideLimit)
+            {
+                armRig.position = rigPosition;
+                armRig.rotation = rigRotation;
+                Debug.LogWarning("机械臂已在折弯机外侧停止弯曲，避免成品穿过探头或机身。", this);
+                yield break;
+            }
+            rotated = next;
+            yield return null;
+        }
+    }
+
+    private IEnumerator RestoreArmPosture(Vector3[] positions, Quaternion[] rotations,
+        float rigScale)
+    {
+        bool moving;
+        do
+        {
+            moving = false;
+            for (int i = 1; i < armMovingVisuals.Length; i++)
+            {
+                Transform visual = armMovingVisuals[i];
+                visual.position = Vector3.MoveTowards(visual.position, positions[i],
+                    armPickupSpeed * Time.deltaTime);
+                visual.rotation = Quaternion.RotateTowards(visual.rotation, rotations[i],
+                    armRotationSpeed * Time.deltaTime);
+                moving |= Vector3.Distance(visual.position, positions[i]) > positionTolerance
+                    || Quaternion.Angle(visual.rotation, rotations[i]) > 0.01f;
+            }
+            float nextScale = Mathf.MoveTowards(armRig.localScale.x, rigScale,
+                armPickupSpeed * Time.deltaTime);
+            armRig.localScale = Vector3.one * nextScale;
+            moving |= Mathf.Abs(nextScale - rigScale) > 0.0001f;
+            if (moving) yield return null;
+        } while (moving);
+        for (int i = 1; i < armMovingVisuals.Length; i++)
+        {
+            armMovingVisuals[i].position = positions[i];
+            armMovingVisuals[i].rotation = rotations[i];
+        }
+        armRig.localScale = Vector3.one * rigScale;
+    }
+
+    private Vector3 SuctionContactPoint()
+    {
+        return armContactAnchor.position;
+    }
+
+    private Vector3 FindSuctionCupContactPoint()
+    {
+        Bounds cups = GetBounds(FindModelNode(armSuctionAssembly, 860));
+        foreach (int id in new[] { 866, 867, 868 })
+            cups.Encapsulate(GetBounds(FindModelNode(armSuctionAssembly, id)));
+        return new Vector3(cups.center.x, cups.min.y, cups.center.z);
+    }
+
+    private Vector3 SheetTopCenter()
+    {
+        Bounds bounds = GetBounds(sheet);
+        return new Vector3(bounds.center.x, bounds.max.y, bounds.center.z);
+    }
+
+    private IEnumerator MoveArmSuctionTo(Vector3 contactDestination)
+    {
+        Vector3 pivot = armRig.position;
+        Vector3 current = SuctionContactPoint() - pivot;
+        Vector3 target = contactDestination - pivot;
+        if (current.sqrMagnitude < 0.000001f || target.sqrMagnitude < 0.000001f)
+        {
+            Fail("机械臂吸盘目标与基座关节重合，无法保持模型连接");
+            yield break;
+        }
+
+        // Imported links are siblings. Drive their shared rig around the fixed
+        // base joint so no individual link can pull away from its neighbours.
+        Quaternion startRotation = armRig.rotation;
+        Quaternion targetRotation = Quaternion.FromToRotation(current, target)
+            * startRotation;
+        float startScale = armRig.localScale.x;
+        float targetScale = startScale * target.magnitude / current.magnitude;
+        float duration = Mathf.Max(
+            Vector3.Distance(SuctionContactPoint(), contactDestination)
+                / Mathf.Max(0.01f, armPickupSpeed),
+            Quaternion.Angle(startRotation, targetRotation)
+                / Mathf.Max(0.01f, armRotationSpeed), 0.01f);
+        float elapsed = 0f;
+        while (elapsed < duration)
+        {
+            elapsed = Mathf.Min(duration, elapsed + Time.deltaTime);
+            float fraction = elapsed / duration;
+            armRig.rotation = Quaternion.Slerp(startRotation, targetRotation, fraction);
+            armRig.localScale = Vector3.one * Mathf.Lerp(startScale, targetScale,
+                fraction);
+            yield return null;
+        }
+        armRig.rotation = targetRotation;
+        armRig.localScale = Vector3.one * targetScale;
+    }
+
+    private bool ReplaceSheetWithFinishedPart()
+    {
+        if (finishedPartPrefab == null) return Fail("缺少加工零件 冲压完毕.fbx 引用");
+        Vector3 oldBottom = SheetBottomCenter();
+        GameObject finished = Instantiate(finishedPartPrefab, workpieceRoot);
+        finished.name = "FinishedPart";
+        OrientSheetFlat(finished.transform);
+        Bounds bounds = GetBounds(finished.transform);
+        float width = Mathf.Max(bounds.size.x, bounds.size.z);
+        if (width <= 0.0001f)
+        {
+            Destroy(finished);
+            return Fail("成品模型没有有效的 Renderer bounds");
+        }
+        finished.transform.localScale *= rawSheetWorldWidth / width;
+        Bounds resized = GetBounds(finished.transform);
+        finished.transform.position += oldBottom
+            - new Vector3(resized.center.x, resized.min.y, resized.center.z);
+        rawSheetInstance.gameObject.SetActive(false);
+        sheet = finished.transform;
+        ApplyWorkpieceColor(sheet);
+        SetState(LoadingState.ReplaceWithFinishedPart, "原料已替换为冲压完毕成品");
+        return true;
+    }
+
+    private bool TryGetPunchXRailEnd(out Vector3 destination)
+    {
+        destination = punchClampMover.position;
+        if (punchRailShell == null)
+            return Fail("未找到转塔冲床导轨壳 r1490，无法确定出料终点");
+        Bounds shell = GetBounds(punchRailShell);
+        if (shell.size.x <= positionTolerance)
+            return Fail("转塔冲床导轨壳 r1490 没有有效的 X 轴范围");
+        const float clearance = 0.03f;
+        float minimumTravel = float.NegativeInfinity;
+        float maximumTravel = float.PositiveInfinity;
+        foreach (Transform assembly in punchClampVisuals)
+        {
+            Transform slider = FindModelNode(assembly, 1420);
+            if (slider == null) return Fail("冲床夹爪缺少 r1420 滑块，无法计算 X 轴行程");
+            Bounds bounds = GetBounds(slider);
+            minimumTravel = Mathf.Max(minimumTravel, shell.min.x + clearance - bounds.min.x);
+            maximumTravel = Mathf.Min(maximumTravel, shell.max.x - clearance - bounds.max.x);
+        }
+        if (minimumTravel > maximumTravel)
+            return Fail("两套冲床夹爪的滑块无法同时处于 r1490 导轨壳范围内");
+        // 场景镜头中向左对应 Unity 世界 X 正方向。
+        float travel = maximumTravel;
+        if (travel <= positionTolerance)
+            return Fail("冲床夹爪无法沿 X 轴正方向移动到 r1490 尽头");
+        destination.x += travel;
+        Debug.Log(string.Format("冲床成品出料：夹爪沿 Unity 世界 X 正方向移动 {0:F3}m，到达 r1490 尽头 X={1:F3}",
+            travel, shell.max.x), this);
+        return true;
     }
 
     private IEnumerator MoveCarrier(Transform carrier, Transform[] visuals,
@@ -506,30 +1176,52 @@ public sealed class LoadingProcessController : MonoBehaviour
             FindModelNode(second, 1463), FindModelNode(second, 1466) };
     }
 
-    private void AlignPunchClampAssemblies()
+    private void SyncPunchClampPointsToPlacedAssemblies()
     {
-        for (int i = 0; i < 2; i++)
-            SeatPunchAssembly(punchClampVisuals[i], punchClampBrackets[i],
-                punchRailFrame, punchClampRail, punchTable,
-                punchJawsA[i * 2], punchJawsB[i * 2],
-                punchJawsA[i * 2 + 1], punchJawsB[i * 2 + 1],
-                punchTableGrooveInset, punchRailOutsideClearance);
-
+        // Use the positions saved in the scene; entering Play must not seat the
+        // assemblies or shift their individual jaw meshes again.
         Bounds combined = GetBounds(punchClampVisuals[0]);
         combined.Encapsulate(GetBounds(punchClampVisuals[1]));
         Vector3 home = combined.center;
         punchClampHomePoint.position = home;
         punchClampAcquirePoint.position = home;
-        Vector3 axis = punchRailEndPoint.position - punchRailStartPoint.position;
-        axis.y = 0f;
-        if (axis.sqrMagnitude < 0.01f) return;
-        axis.Normalize();
-        Bounds rail = GetBounds(punchClampRail);
-        float railCenter = Vector3.Dot(rail.center, axis);
-        float radius = HorizontalRadius(rail, axis);
-        float homeAlong = Vector3.Dot(home, axis);
-        punchRailStartPoint.position = home + axis * (railCenter - radius + 0.08f - homeAlong);
-        punchRailEndPoint.position = home + axis * (railCenter + radius - 0.08f - homeAlong);
+        punchRailStartPoint.position = home;
+        if (punchRightGuard != null)
+            punchRailEndPoint.position = new Vector3(home.x, home.y,
+                GetBounds(punchRightGuard).center.z);
+    }
+
+    private float SafePunchClampTravel(float requestedZ, Bounds guard)
+    {
+        float direction = Mathf.Sign(requestedZ);
+        float distance = Mathf.Abs(requestedZ);
+        const float clearance = 0.03f;
+        foreach (Transform assembly in punchClampVisuals)
+        {
+            foreach (int sourceId in new[] { 1427, 1430 })
+            {
+                Transform support = FindModelNode(assembly, sourceId);
+                if (support == null)
+                {
+                    Debug.LogWarning("LoadingProcessController: 未找到夹爪电线支板 r"
+                        + sourceId + "，冲床夹爪停止在原位以避免穿模。", assembly);
+                    return 0f;
+                }
+                Bounds bounds = GetBounds(support);
+                // The guard and support can meet only when their X/Y ranges overlap.
+                if (bounds.max.x <= guard.min.x || bounds.min.x >= guard.max.x
+                    || bounds.max.y <= guard.min.y || bounds.min.y >= guard.max.y)
+                    continue;
+                float available = direction > 0f
+                    ? guard.min.z - clearance - bounds.max.z
+                    : bounds.min.z - guard.max.z - clearance;
+                if (available < distance)
+                    Debug.Log(string.Format("冲床夹爪避让：{0} 限制模型 Y 行程为 {1:F3}m，保护罩前保留 {2:F3}m 间隙。",
+                        support.name, Mathf.Max(0f, available), clearance), support);
+                distance = Mathf.Min(distance, Mathf.Max(0f, available));
+            }
+        }
+        return direction * distance;
     }
 
     public static bool SeatPunchAssembly(Transform assembly, Transform bracket,
@@ -962,23 +1654,6 @@ public sealed class LoadingProcessController : MonoBehaviour
             + Mathf.Abs(axis.z) * bounds.extents.z;
     }
 
-    private void AlignAutoPunchStartToRail()
-    {
-        Vector3 axis = punchRailEndPoint.position - punchRailStartPoint.position;
-        axis.y = 0f;
-        axis.Normalize();
-        Vector3 boardPosition = SheetBottomCenter();
-        Vector3 requested = punchStartPoint.position - boardPosition;
-        Vector3 horizontal = new Vector3(requested.x, 0f, requested.z);
-        Vector3 projected = axis * Vector3.Dot(horizontal, axis);
-        float deviation = (horizontal - projected).magnitude;
-        if (deviation > 0.02f)
-        {
-            punchStartPoint.position = boardPosition + projected;
-            Debug.LogWarning("LoadingProcessController: 已将 PunchStartPoint 对齐到板材当前轨迹。", this);
-        }
-    }
-
     private static Transform CreateRuntimeRailStart(Transform rail, Transform home,
         Transform end, string name)
     {
@@ -1169,6 +1844,14 @@ public sealed class LoadingProcessController : MonoBehaviour
         return positions;
     }
 
+    private static Quaternion[] SaveRotations(Transform[] visuals)
+    {
+        Quaternion[] rotations = new Quaternion[visuals.Length];
+        for (int i = 0; i < visuals.Length; i++)
+            rotations[i] = visuals[i].rotation;
+        return rotations;
+    }
+
     private static Vector3[] SaveLocalPositions(Transform[] parts)
     {
         if (parts == null) return new Vector3[0];
@@ -1194,14 +1877,24 @@ public sealed class LoadingProcessController : MonoBehaviour
 
     private bool ValidateSetup()
     {
-        bool valid = rawSheetPrefab != null && workpieceRoot != null && materialTable != null
+        bool valid = rawSheetPrefab != null && finishedPartPrefab != null
+            && workpieceRoot != null && materialTable != null
+            && armLongSlot != null && armBaseAssembly != null && bendingProbe != null
+            && armBaseJoint != null && armSuctionAssembly != null
+            && armSegments != null && System.Array.TrueForAll(armSegments, part => part != null)
+            && armSliders != null && System.Array.TrueForAll(armSliders, slider => slider != null)
+            && bendingBody != null && bendingRail != null
+            && FindModelNode(armSuctionAssembly, 860) != null
+            && FindModelNode(armSuctionAssembly, 866) != null
+            && FindModelNode(armSuctionAssembly, 867) != null
+            && FindModelNode(armSuctionAssembly, 868) != null
             && controlConsole != null
             && suctionMover != null && clampMover != null && suctionHome != null
             && suctionRail != null && suctionRack != null && suctionGear != null
             && suctionHousing != null && suctionVerticalGuide != null
             && pickupClampBeam != null
             && punchClampMover != null && punchClampRail != null
-            && punchRailFrame != null
+            && punchRailFrame != null && punchRailShell != null
             && punchTable != null && punchClampBrackets != null
             && punchClampBrackets.Length == 2 && punchClampBrackets[0] != null
             && punchClampBrackets[1] != null

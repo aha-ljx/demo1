@@ -16,7 +16,11 @@ internal static class LoadingSceneSetup
     }
 
     [MenuItem("Tools/Factory/Configure Loading Scene")]
-    private static void ConfigureActiveScene()
+    private static void ReconfigureActiveScene() => ConfigureActiveScene(true);
+
+    private static void ConfigureActiveScene() => ConfigureActiveScene(false);
+
+    private static void ConfigureActiveScene(bool force)
     {
         if (EditorApplication.isPlayingOrWillChangePlaymode) return;
         Scene scene = EditorSceneManager.GetActiveScene();
@@ -57,6 +61,9 @@ internal static class LoadingSceneSetup
             && controller.punchClampHomePoint != null && controller.punchClampAcquirePoint != null
             && controller.punchRailStartPoint != null && controller.punchRailEndPoint != null
             && controller.transferToPunchPoint != null;
+        // A configured scene may contain hand-adjusted clamp transforms. Only the
+        // explicit menu command is allowed to run the model seating routine again.
+        if (alreadyConfigured && !force) return;
         Transform modelRoot = FindModelRoot(scene);
         if (modelRoot == null)
         {
@@ -294,6 +301,8 @@ internal static class LoadingSceneSetup
 
         controller.rawSheetPrefab = AssetDatabase.LoadAssetAtPath<GameObject>(
             "Assets/Moudles/加工零件.fbx");
+        controller.finishedPartPrefab = AssetDatabase.LoadAssetAtPath<GameObject>(
+            "Assets/Moudles/加工零件 冲压完毕.fbx");
         controller.materialTable = table.GetComponent<Renderer>();
         controller.controlConsole = console.GetComponent<Renderer>();
         controller.suctionVisuals = new[] { suctionAssembly, suctionBox };
